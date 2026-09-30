@@ -1,0 +1,1355 @@
+package drivers
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+
+	// import postgresql driver
+	_ "github.com/lib/pq"
+	"github.com/xo/dburl"
+
+	"github.com/jorgerojas26/lazysql/helpers/logger"
+	"github.com/jorgerojas26/lazysql/models"
+)
+
+type Postgres struct {
+	Connection       *sql.DB
+	Provider         string
+	CurrentDatabase  string
+	PreviousDatabase string
+	Urlstr           string
+	PoolConfig       models.ConnectionPoolConfig
+}
+
+func (db *Postgres) TestConnection(ctx context.Context, urlstr string) error {
+	return db.Connect(ctx, urlstr)
+}
+
+func (db *Postgres) Connect(ctx context.Context, urlstr string) error {
+	ctx = contextOrBackground(ctx)
+	db.SetProvider(DriverPostgres)
+
+	connection, err := dburl.Open(urlstr)
+	if err != nil {
+		return err
+	}
+
+	if err = applyConnectionPoolConfig(connection, db.PoolConfig); err != nil {
+		_ = connection.Close()
+		return err
+	}
+
+	db.Connection = connection
+
+	err = db.Connection.PingContext(ctx)
+	if err != nil {
+		return err
+	}
+
+	db.Urlstr = urlstr
+
+	// Get the current database.
+	rows := db.Connection.QueryRowContext(ctx, "SELECT current_database();")
+
+	database := ""
+	err = rows.Scan(&database)
+	if err != nil {
+		return err
+	}
+
+	db.CurrentDatabase = database
+	db.PreviousDatabase = database
+
+	return nil
+}
+
+func (db *Postgres) GetDatabases(ctx context.Context) ([]string, error) {
+	ctx = contextOrBackground(ctx)
+	rows, err := db.Connection.QueryContext(ctx, "SELECT datname FROM pg_database WHERE datallowconn AND has_database_privilege(current_user, datname, 'CONNECT');")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var databases []string
+	for rows.Next() {
+		var database string
+		err := rows.Scan(&database)
+		if err != nil {
+			return nil, err
+		}
+		databases = append(databases, database)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return databases, nil
+}
+
+func (db *Postgres) GetTables(ctx context.Context, database string) (map[string][]string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return nil, err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	query := "SELECT table_name, table_schema FROM information_schema.tables WHERE table_catalog = $1"
+	rows, err := conn.QueryContext(ctx, query, database)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tables := make(map[string][]string)
+	for rows.Next() {
+		var (
+			tableName   string
+			tableSchema string
+		)
+		if err := rows.Scan(&tableName, &tableSchema); err != nil {
+			return nil, err
+		}
+
+		tables[tableSchema] = append(tables[tableSchema], tableName)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return tables, nil
+}
+
+func (db *Postgres) GetTableColumns(ctx context.Context, database, table string) ([][]string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+	if table == "" {
+		return nil, errors.New("table name is required")
+	}
+
+	splitTableString := strings.Split(table, ".")
+
+	if len(splitTableString) == 1 {
+		return nil, errors.New("table must be in the format schema.table")
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return nil, err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	tableSchema := splitTableString[0]
+	tableName := splitTableString[1]
+
+	query := "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, COALESCE(pd.description, '') as comment FROM information_schema.columns c LEFT JOIN pg_class pc ON pc.relname = c.table_name AND pc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = c.table_schema) LEFT JOIN pg_namespace pn ON pn.nspname = c.table_schema AND pn.oid = pc.relnamespace LEFT JOIN pg_description pd ON pd.objoid = pc.oid AND pd.objsubid = c.ordinal_position WHERE c.table_catalog = $1 AND c.table_schema = $2 AND c.table_name = $3 ORDER by c.ordinal_position"
+
+	rows, err := conn.QueryContext(ctx, query, database, tableSchema, tableName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	results := [][]string{columns}
+	for rows.Next() {
+		rowValues := make([]any, len(columns))
+
+		for i := range columns {
+			rowValues[i] = new(sql.RawBytes)
+		}
+
+		if err := rows.Scan(rowValues...); err != nil {
+			return nil, err
+		}
+
+		var row []string
+		for _, col := range rowValues {
+			row = append(row, string(*col.(*sql.RawBytes)))
+		}
+
+		results = append(results, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return results, nil
+}
+
+// qualifiedTableConnection validates a "schema.table" argument, splits it and
+// returns a connection scoped to the given database. The returned closeConn is
+// always safe to defer: it is a no-op when the shared connection is reused.
+func (db *Postgres) qualifiedTableConnection(ctx context.Context, database, table string) (conn *sql.DB, closeConn func(), tableSchema, tableName string, err error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, nil, "", "", errors.New("database name is required")
+	}
+	if table == "" {
+		return nil, nil, "", "", errors.New("table name is required")
+	}
+
+	splitTableString := strings.Split(table, ".")
+	if len(splitTableString) == 1 {
+		return nil, nil, "", "", errors.New("table must be in the format schema.table")
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return nil, nil, "", "", err
+	}
+
+	closeConn = func() {}
+	if needsClose {
+		closeConn = func() { _ = conn.Close() }
+	}
+
+	return conn, closeConn, splitTableString[0], splitTableString[1], nil
+}
+
+func (db *Postgres) GetConstraints(ctx context.Context, database, table string) ([][]string, error) {
+	ctx = contextOrBackground(ctx)
+	conn, closeConn, tableSchema, tableName, err := db.qualifiedTableConnection(ctx, database, table)
+	if err != nil {
+		return nil, err
+	}
+	defer closeConn()
+
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf(`
+        SELECT
+            tc.constraint_name,
+            kcu.column_name,
+            tc.constraint_type
+        FROM
+            information_schema.table_constraints AS tc
+            JOIN information_schema.key_column_usage AS kcu ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage AS ccu ON ccu.constraint_name = tc.constraint_name
+            AND ccu.table_schema = tc.table_schema
+        WHERE
+            NOT tc.constraint_type = 'FOREIGN KEY'
+			AND tc.table_schema = '%s'
+            AND tc.table_name = '%s'
+            `, tableSchema, tableName))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	constraints := [][]string{columns}
+	for rows.Next() {
+		rowValues := make([]any, len(columns))
+		for i := range columns {
+			rowValues[i] = new(sql.RawBytes)
+		}
+
+		if err := rows.Scan(rowValues...); err != nil {
+			return nil, err
+		}
+
+		var row []string
+		for _, col := range rowValues {
+			row = append(row, string(*col.(*sql.RawBytes)))
+		}
+
+		constraints = append(constraints, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return constraints, nil
+}
+
+func (db *Postgres) GetForeignKeys(ctx context.Context, database, table string) ([][]string, error) {
+	ctx = contextOrBackground(ctx)
+	conn, closeConn, tableSchema, tableName, err := db.qualifiedTableConnection(ctx, database, table)
+	if err != nil {
+		return nil, err
+	}
+	defer closeConn()
+
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf(`
+        SELECT
+            con.conname AS constraint_name,
+            src_att.attname AS column_name,
+            ref_ns.nspname AS foreign_table_schema,
+            ref_cls.relname AS foreign_table_name,
+            ref_att.attname AS foreign_column_name
+        FROM pg_constraint con
+        JOIN pg_class src_cls ON src_cls.oid = con.conrelid
+        JOIN pg_namespace src_ns ON src_ns.oid = src_cls.relnamespace
+        JOIN pg_class ref_cls ON ref_cls.oid = con.confrelid
+        JOIN pg_namespace ref_ns ON ref_ns.oid = ref_cls.relnamespace
+        JOIN LATERAL unnest(con.conkey, con.confkey) AS fk(src_attnum, ref_attnum) ON true
+        JOIN pg_attribute src_att ON src_att.attrelid = con.conrelid AND src_att.attnum = fk.src_attnum
+        JOIN pg_attribute ref_att ON ref_att.attrelid = con.confrelid AND ref_att.attnum = fk.ref_attnum
+        WHERE con.contype = 'f'
+          AND src_ns.nspname = '%s'
+          AND src_cls.relname = '%s'
+        ORDER BY con.conname, src_att.attnum
+  `, tableSchema, tableName))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	foreignKeys := [][]string{columns}
+	for rows.Next() {
+		rowValues := make([]any, len(columns))
+		for i := range columns {
+			rowValues[i] = new(sql.RawBytes)
+		}
+
+		if err := rows.Scan(rowValues...); err != nil {
+			return nil, err
+		}
+
+		var row []string
+		for _, col := range rowValues {
+			row = append(row, string(*col.(*sql.RawBytes)))
+		}
+
+		foreignKeys = append(foreignKeys, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return foreignKeys, nil
+}
+
+// GetReferencingTables returns every foreign key that points at the given
+// table, i.e. the reverse direction of GetForeignKeys.
+func (db *Postgres) GetReferencingTables(ctx context.Context, database, table string) ([][]string, error) {
+	conn, closeConn, tableSchema, tableName, err := db.qualifiedTableConnection(ctx, database, table)
+	if err != nil {
+		return nil, err
+	}
+	defer closeConn()
+
+	rows, err := conn.QueryContext(contextOrBackground(ctx), `
+        SELECT
+            con.conname AS constraint_name,
+            src_ns.nspname AS table_schema,
+            src_cls.relname AS table_name,
+            src_att.attname AS column_name,
+            ref_att.attname AS referenced_column_name
+        FROM pg_constraint con
+        JOIN pg_class src_cls ON src_cls.oid = con.conrelid
+        JOIN pg_namespace src_ns ON src_ns.oid = src_cls.relnamespace
+        JOIN pg_class ref_cls ON ref_cls.oid = con.confrelid
+        JOIN pg_namespace ref_ns ON ref_ns.oid = ref_cls.relnamespace
+        JOIN LATERAL unnest(con.conkey, con.confkey) AS fk(src_attnum, ref_attnum) ON true
+        JOIN pg_attribute src_att ON src_att.attrelid = con.conrelid AND src_att.attnum = fk.src_attnum
+        JOIN pg_attribute ref_att ON ref_att.attrelid = con.confrelid AND ref_att.attnum = fk.ref_attnum
+        WHERE con.contype = 'f'
+          AND ref_ns.nspname = $1
+          AND ref_cls.relname = $2
+        ORDER BY src_ns.nspname, src_cls.relname, con.conname, src_att.attnum
+  `, tableSchema, tableName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return scanReferencingTables(rows)
+}
+
+func (db *Postgres) GetIndexes(ctx context.Context, database, table string) ([][]string, error) {
+	ctx = contextOrBackground(ctx)
+	conn, closeConn, tableSchema, tableName, err := db.qualifiedTableConnection(ctx, database, table)
+	if err != nil {
+		return nil, err
+	}
+	defer closeConn()
+
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf(`
+        SELECT
+            i.relname AS index_name,
+            a.attname AS column_name,
+            am.amname AS type
+        FROM
+            pg_namespace n,
+            pg_class t,
+            pg_class i,
+            pg_index ix,
+            pg_attribute a,
+            pg_am am
+        WHERE
+            t.oid = ix.indrelid
+            and i.oid = ix.indexrelid
+            and a.attrelid = t.oid
+            and a.attnum = ANY(ix.indkey)
+            and t.relkind = 'r'
+            and am.oid = i.relam
+          	and n.oid = t.relnamespace
+            and n.nspname = '%s'
+            and t.relname = '%s'
+        ORDER BY
+            t.relname,
+            i.relname
+  `, tableSchema, tableName))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	indexes := [][]string{columns}
+	for rows.Next() {
+		rowValues := make([]any, len(columns))
+		for i := range columns {
+			rowValues[i] = new(sql.RawBytes)
+		}
+
+		if err := rows.Scan(rowValues...); err != nil {
+			return nil, err
+		}
+
+		var row []string
+		for _, col := range rowValues {
+			row = append(row, string(*col.(*sql.RawBytes)))
+		}
+
+		indexes = append(indexes, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return indexes, nil
+}
+
+func (db *Postgres) GetRecords(ctx context.Context, database, table, where, sort string, offset, limit int) (PageResult, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return PageResult{}, errors.New("database name is required")
+	}
+	if table == "" {
+		return PageResult{}, errors.New("table name is required")
+	}
+
+	formattedTableName, err := db.formatTableName(table)
+	if err != nil {
+		return PageResult{}, err
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return PageResult{}, err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	pageSize, fetchLimit := pageSizeAndFetchLimit(limit)
+	queryString := "SELECT * FROM "
+	queryString += formattedTableName
+
+	if where != "" {
+		queryString += fmt.Sprintf(" %s", where)
+	}
+
+	if sort != "" {
+		queryString += fmt.Sprintf(" ORDER BY %s", sort)
+	}
+
+	queryString += " LIMIT $1 OFFSET $2"
+
+	paginatedRows, err := conn.QueryContext(ctx, queryString, fetchLimit, offset)
+	if err != nil {
+		return PageResult{Query: queryString}, err
+	}
+	defer paginatedRows.Close()
+
+	columns, columnsError := paginatedRows.Columns()
+	if columnsError != nil {
+		return PageResult{Query: queryString}, columnsError
+	}
+
+	records := [][]string{columns}
+	for paginatedRows.Next() {
+		nullStringSlice := make([]sql.NullString, len(columns))
+
+		rowValues := make([]any, len(columns))
+		for i := range nullStringSlice {
+			rowValues[i] = &nullStringSlice[i]
+		}
+
+		if err := paginatedRows.Scan(rowValues...); err != nil {
+			return PageResult{Query: queryString}, err
+		}
+
+		var row []string
+		for _, col := range nullStringSlice {
+			if col.Valid {
+				if col.String == "" {
+					row = append(row, "EMPTY&")
+				} else {
+					row = append(row, col.String)
+				}
+			} else {
+				row = append(row, "NULL&")
+			}
+		}
+
+		records = append(records, row)
+	}
+
+	if err := paginatedRows.Err(); err != nil {
+		return PageResult{Query: queryString}, err
+	}
+	// close to release the connection
+	if err := paginatedRows.Close(); err != nil {
+		return PageResult{Query: queryString}, err
+	}
+
+	// Replace the limit and offset with actual values in the query string.
+	queryString = strings.Replace(queryString, "$1", strconv.Itoa(fetchLimit), 1)
+	queryString = strings.Replace(queryString, "$2", strconv.Itoa(offset), 1)
+
+	return newPageResult(records, queryString, pageSize), nil
+}
+
+func (db *Postgres) GetEstimatedRowCount(ctx context.Context, database, table string) (*int64, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+	if table == "" {
+		return nil, errors.New("table name is required")
+	}
+
+	parts := strings.SplitN(table, ".", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return nil, errors.New("table must be in the format schema.table")
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return nil, err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	var estimate sql.NullInt64
+	err = conn.QueryRowContext(ctx, `
+		SELECT c.reltuples::bigint
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2
+	`, parts[0], parts[1]).Scan(&estimate)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !estimate.Valid || estimate.Int64 < 0 {
+		return nil, nil
+	}
+
+	return &estimate.Int64, nil
+}
+
+func (db *Postgres) GetExactRowCount(ctx context.Context, database, table, where string) (int64, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return 0, errors.New("database name is required")
+	}
+	if table == "" {
+		return 0, errors.New("table name is required")
+	}
+
+	formattedTableName, err := db.formatTableName(table)
+	if err != nil {
+		return 0, err
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return 0, err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	query := "SELECT COUNT(*) FROM " + formattedTableName
+	if where != "" {
+		query += " " + where
+	}
+
+	var count int64
+	if err := conn.QueryRowContext(ctx, query).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (db *Postgres) UpdateRecord(ctx context.Context, database, table, column, value, primaryKeyColumnName, primaryKeyValue string) error {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return errors.New("database name is required")
+	}
+	if table == "" {
+		return errors.New("table name is required")
+	}
+	if column == "" {
+		return errors.New("column name is required")
+	}
+	if value == "" {
+		return errors.New("value is required")
+	}
+	if primaryKeyColumnName == "" {
+		return errors.New("primary key column name is required")
+	}
+	if primaryKeyValue == "" {
+		return errors.New("primary key value is required")
+	}
+
+	formattedTableName, formatErr := db.formatTableName(table)
+
+	if formatErr != nil {
+		return formatErr
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	query := "UPDATE "
+	query += formattedTableName
+	query += fmt.Sprintf(" SET \"%s\" = $1 WHERE \"%s\" = $2", column, primaryKeyColumnName)
+
+	_, err = conn.ExecContext(ctx, query, value, primaryKeyValue)
+	return err
+}
+
+func (db *Postgres) DeleteRecord(ctx context.Context, database, table, primaryKeyColumnName, primaryKeyValue string) error {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return errors.New("database name is required")
+	}
+	if table == "" {
+		return errors.New("table name is required")
+	}
+	if primaryKeyColumnName == "" {
+		return errors.New("primary key column name is required")
+	}
+	if primaryKeyValue == "" {
+		return errors.New("primary key value is required")
+	}
+
+	formattedTableName, formatErr := db.formatTableName(table)
+	if formatErr != nil {
+		return formatErr
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	query := "DELETE FROM "
+	query += formattedTableName
+	query += fmt.Sprintf(" WHERE \"%s\" = $1", primaryKeyColumnName)
+
+	_, err = conn.ExecContext(ctx, query, primaryKeyValue)
+	return err
+}
+
+func (db *Postgres) ExecuteDMLStatement(ctx context.Context, database, query string) (result string, err error) {
+	if database == "" {
+		database = db.CurrentDatabase
+	}
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return "", err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	ctx = contextOrBackground(ctx)
+	res, err := conn.ExecContext(ctx, query)
+	if err != nil {
+		return result, err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return result, err
+	}
+	return fmt.Sprintf("%d rows affected", rowsAffected), nil
+}
+
+// StreamQuery incrementally emits interactive SQL results and honors context
+// cancellation through database/sql.
+func (db *Postgres) StreamQuery(ctx context.Context, database, query string, maxRows int, onBatch func(QueryBatch) error) (QueryStreamResult, error) {
+	if database == "" {
+		database = db.CurrentDatabase
+	}
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return QueryStreamResult{}, err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	return streamQuery(ctx, conn, query, maxRows, onBatch)
+}
+
+func (db *Postgres) ExecuteQuery(ctx context.Context, database, query string) ([][]string, int, error) {
+	if database == "" {
+		database = db.CurrentDatabase
+	}
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return nil, 0, err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	ctx = contextOrBackground(ctx)
+	rows, err := conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	records := make([][]string, 0)
+	for rows.Next() {
+		rowValues := make([]any, len(columns))
+		for i := range columns {
+			rowValues[i] = new(sql.RawBytes)
+		}
+
+		err = rows.Scan(rowValues...)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		var row []string
+		for _, col := range rowValues {
+			row = append(row, string(*col.(*sql.RawBytes)))
+		}
+
+		records = append(records, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	// Prepend the columns to the records.
+	results := append([][]string{columns}, records...)
+
+	return results, len(records), nil
+}
+
+func (db *Postgres) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
+	ctx = contextOrBackground(ctx)
+	if len(changes) == 0 {
+		return nil
+	}
+	database := changes[0].Database
+	if database == "" {
+		database = db.CurrentDatabase
+	}
+	var queries []models.Query
+
+	for _, change := range changes {
+		target := change.Database
+		if target == "" {
+			target = db.CurrentDatabase
+		}
+		if target != database {
+			return errors.New("cannot atomically apply PostgreSQL changes across databases; apply each database separately")
+		}
+
+		formattedTableName, formatErr := db.formatTableName(change.Table)
+		if formatErr != nil {
+			return formatErr
+		}
+
+		switch change.Type {
+
+		case models.DMLInsertType:
+			queries = append(queries, buildInsertQuery(formattedTableName, change.Values, db))
+		case models.DMLUpdateType:
+			queries = append(queries, buildUpdateQuery(formattedTableName, change.Values, change.PrimaryKeyInfo, db))
+		case models.DMLDeleteType:
+			queries = append(queries, buildDeleteQuery(formattedTableName, change.PrimaryKeyInfo, db))
+		}
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+	return queriesInTransaction(ctx, conn, queries)
+}
+
+func (db *Postgres) GetPrimaryKeyColumnNames(ctx context.Context, database, table string) ([]string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+	if table == "" {
+		return nil, errors.New("table name is required")
+	}
+
+	splitTableString := strings.Split(table, ".")
+	if len(splitTableString) != 2 {
+		return nil, errors.New("table must be in the format schema.table")
+	}
+
+	schemaName := splitTableString[0]
+	tableName := splitTableString[1]
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return nil, err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	row, err := conn.QueryContext(ctx, `
+		SELECT
+			a.attname AS column_name
+		FROM
+			pg_index i
+			JOIN pg_class c ON c.oid = i.indrelid
+			JOIN pg_attribute a ON a.attrelid = c.oid
+				AND a.attnum = ANY (i.indkey)
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE
+			relname = $2 AND nspname = $1 AND indisprimary
+	`, schemaName, tableName)
+	if err != nil {
+		logger.Error("GetPrimaryKeyColumnNames", map[string]any{"error": err.Error()})
+		return nil, err
+	}
+
+	defer row.Close()
+
+	var primaryKeyColumnName []string
+	for row.Next() {
+		var colName string
+		err = row.Scan(&colName)
+		if err != nil {
+			return nil, err
+		}
+
+		if row.Err() != nil {
+			return nil, row.Err()
+		}
+
+		primaryKeyColumnName = append(primaryKeyColumnName, colName)
+	}
+
+	if row.Err() != nil {
+		return nil, row.Err()
+	}
+
+	return primaryKeyColumnName, nil
+}
+
+func (db *Postgres) SetProvider(provider string) {
+	db.Provider = provider
+}
+
+func (db *Postgres) GetProvider() string {
+	return db.Provider
+}
+
+func dsnValue(dsn, key string) string {
+	prefix := key + "="
+	for _, part := range strings.Split(dsn, " ") {
+		if after, ok := strings.CutPrefix(part, prefix); ok {
+			return after
+		}
+	}
+	return ""
+}
+
+func buildReconnectURL(urlstr, newDB string) (string, error) {
+	parsed, err := dburl.Parse(urlstr)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Transport == "unix" {
+		host := dsnValue(parsed.DSN, "host")
+		port := dsnValue(parsed.DSN, "port")
+		if port != "" {
+			parsed.Path = host + ":" + port + "/" + newDB
+		} else {
+			parsed.Path = host + "/" + newDB
+		}
+	} else {
+		parsed.Path = "/" + newDB
+	}
+	return parsed.String(), nil
+}
+
+// connectToDatabase opens a new connection to the given database without
+// mutating the receiver. The caller must close the returned connection.
+func (db *Postgres) connectToDatabase(ctx context.Context, database string) (*sql.DB, error) {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	urlstr, err := buildReconnectURL(db.Urlstr, database)
+	if err != nil {
+		return nil, err
+	}
+	connection, err := dburl.Open(urlstr)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyConnectionPoolConfig(connection, db.PoolConfig); err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	return connection, nil
+}
+
+// connectionFor returns a connection to the given database. If it matches
+// the current database, the existing connection is returned (caller must NOT
+// close it). Otherwise a new temporary connection is opened and returned
+// (caller MUST close it).
+func (db *Postgres) connectionFor(ctx context.Context, database string) (conn *sql.DB, needsClose bool, err error) {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if database == db.CurrentDatabase {
+		return db.Connection, false, nil
+	}
+	conn, err = db.connectToDatabase(ctx, database)
+	if err != nil {
+		return nil, false, err
+	}
+	return conn, true, nil
+}
+
+func (db *Postgres) SwitchDatabase(ctx context.Context, database string) error {
+	ctx = contextOrBackground(ctx)
+	conn, err := db.connectToDatabase(ctx, database)
+	if err != nil {
+		return err
+	}
+
+	err = db.Connection.Close()
+	if err != nil {
+		if closeErr := conn.Close(); closeErr != nil {
+			logger.Error("Failed to close postgres connection", map[string]any{"error": closeErr})
+		}
+		return err
+	}
+
+	db.Connection = conn
+	db.PreviousDatabase = db.CurrentDatabase
+	db.CurrentDatabase = database
+
+	return nil
+}
+
+func (db *Postgres) formatTableName(table string) (string, error) {
+	splitTableString := strings.Split(table, ".")
+
+	if len(splitTableString) == 1 {
+		return "", errors.New("table must be in the format schema.table")
+	}
+
+	tableSchema := splitTableString[0]
+	tableName := splitTableString[1]
+
+	return fmt.Sprintf("\"%s\".\"%s\"", tableSchema, tableName), nil
+}
+
+func (db *Postgres) FormatArg(arg any, colType models.CellValueType) any {
+	if colType == models.Null {
+		return sql.NullString{
+			String: "",
+			Valid:  false,
+		}
+	}
+
+	if colType == models.Empty {
+		return ""
+	}
+
+	if colType == models.String {
+		switch v := arg.(type) {
+		case int, int64:
+			return fmt.Sprintf("%d", v)
+		case float64, float32:
+			s := fmt.Sprintf("%f", v)
+			trimmed := strings.TrimRight(s, "0")
+			if strings.HasSuffix(trimmed, ".") {
+				trimmed += "0"
+			}
+			return trimmed
+		case string:
+			return v
+		case []byte:
+			return string(v)
+		case nil:
+			return sql.NullString{
+				String: "",
+				Valid:  false,
+			}
+		default:
+			return fmt.Sprintf("%v", v)
+		}
+	}
+
+	return fmt.Sprintf("%v", arg)
+}
+
+func (db *Postgres) FormatArgForQueryString(arg any) string {
+	switch v := arg.(type) {
+	case string:
+		if v == "NULL" || v == "DEFAULT" {
+			return v
+		}
+		escaped := strings.ReplaceAll(v, "'", "''")
+		return "'" + escaped + "'"
+	case sql.NullString:
+		if !v.Valid {
+			return "NULL"
+		}
+		escaped := strings.ReplaceAll(v.String, "'", "''")
+		return "'" + escaped + "'"
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func (db *Postgres) FormatReference(reference string) string {
+	return fmt.Sprintf("\"%s\"", reference)
+}
+
+func (db *Postgres) FormatPlaceholder(index int) string {
+	return fmt.Sprintf("$%d", index)
+}
+
+func (db *Postgres) DMLChangeToQueryString(change models.DBDMLChange) (string, error) {
+	var queryStr string
+
+	formattedTableName, err := db.formatTableName(change.Table)
+	if err != nil {
+		return "", err
+	}
+
+	columnNames, values := getColNamesAndArgsAsString(change.Values)
+
+	switch change.Type {
+	case models.DMLInsertType:
+		queryStr = buildInsertQueryString(formattedTableName, columnNames, values, db)
+	case models.DMLUpdateType:
+		queryStr = buildUpdateQueryString(formattedTableName, columnNames, values, change.PrimaryKeyInfo, db)
+	case models.DMLDeleteType:
+		queryStr = buildDeleteQueryString(formattedTableName, change.PrimaryKeyInfo, db)
+
+	}
+
+	return queryStr, nil
+}
+
+func (db *Postgres) GetFunctions(ctx context.Context, database string) (map[string][]string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return nil, err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	rows, err := conn.QueryContext(ctx, `
+		SELECT n.nspname || '.' || p.proname
+		FROM pg_catalog.pg_proc p
+		JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+		WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+		AND p.prokind = 'f'
+		ORDER BY n.nspname, p.proname
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	functions := make(map[string][]string)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		functions[database] = append(functions[database], name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return functions, nil
+}
+
+func (db *Postgres) GetProcedures(ctx context.Context, database string) (map[string][]string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return nil, err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	rows, err := conn.QueryContext(ctx, `
+		SELECT n.nspname || '.' || p.proname
+		FROM pg_catalog.pg_proc p
+		JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+		WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+		AND p.prokind = 'p'
+		ORDER BY n.nspname, p.proname
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	procedures := make(map[string][]string)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		procedures[database] = append(procedures[database], name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return procedures, nil
+}
+
+func (db *Postgres) GetViews(ctx context.Context, database string) (map[string][]string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return nil, err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	rows, err := conn.QueryContext(ctx, `
+		SELECT table_schema || '.' || table_name
+		FROM information_schema.views
+		WHERE table_catalog = $1
+		AND table_schema NOT IN ('pg_catalog', 'information_schema')
+		ORDER BY table_schema, table_name
+	`, database)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	views := make(map[string][]string)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		views[database] = append(views[database], name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return views, nil
+}
+
+func (db *Postgres) SupportsProgramming() bool {
+	return true
+}
+
+func (db *Postgres) UseSchemas() bool {
+	return true
+}
+
+func (db *Postgres) GetFunctionDefinition(ctx context.Context, database, name string) (string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return "", errors.New("database name is required")
+	}
+	if name == "" {
+		return "", errors.New("function name is required")
+	}
+
+	parts := strings.SplitN(name, ".", 2)
+	if len(parts) != 2 {
+		return "", errors.New("function name must be in format schema.name")
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return "", err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	var result string
+	row := conn.QueryRowContext(ctx, `
+		SELECT pg_get_functiondef(p.oid)
+		FROM pg_catalog.pg_proc p
+		JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+		WHERE n.nspname = $1 AND p.proname = $2
+		LIMIT 1
+	`, parts[0], parts[1])
+	if err := row.Scan(&result); err != nil {
+		return "", err
+	}
+
+	return result, nil
+}
+
+func (db *Postgres) GetProcedureDefinition(ctx context.Context, database, name string) (string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return "", errors.New("database name is required")
+	}
+	if name == "" {
+		return "", errors.New("procedure name is required")
+	}
+
+	parts := strings.SplitN(name, ".", 2)
+	if len(parts) != 2 {
+		return "", errors.New("procedure name must be in format schema.name")
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return "", err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	var result string
+	row := conn.QueryRowContext(ctx, `
+		SELECT pg_get_functiondef(p.oid)
+		FROM pg_catalog.pg_proc p
+		JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+		WHERE n.nspname = $1 AND p.proname = $2
+		AND p.prokind = 'p'
+		LIMIT 1
+	`, parts[0], parts[1])
+	if err := row.Scan(&result); err != nil {
+		return "", err
+	}
+
+	return result, nil
+}
+
+func (db *Postgres) GetViewDefinition(ctx context.Context, database, name string) (string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return "", errors.New("database name is required")
+	}
+	if name == "" {
+		return "", errors.New("view name is required")
+	}
+
+	parts := strings.SplitN(name, ".", 2)
+	if len(parts) != 2 {
+		return "", errors.New("view name must be in format schema.name")
+	}
+
+	conn, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return "", err
+	}
+	if needsClose {
+		defer conn.Close()
+	}
+
+	var result string
+	row := conn.QueryRowContext(ctx, `
+		SELECT definition
+		FROM pg_catalog.pg_views
+		WHERE schemaname = $1 AND viewname = $2
+	`, parts[0], parts[1])
+	if err := row.Scan(&result); err != nil {
+		return "", err
+	}
+
+	return result, nil
+}

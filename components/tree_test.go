@@ -1,0 +1,1436 @@
+package components
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/rivo/tview"
+
+	"github.com/jorgerojas26/lazysql/drivers"
+	"github.com/jorgerojas26/lazysql/models"
+)
+
+// ── parseSearchQuery ────────────────────────────────────────────────────────
+
+func TestParseSearchQuery(t *testing.T) {
+	testCases := []struct {
+		name            string
+		query           string
+		wantAncestors   []string
+		wantTableFilter string
+	}{
+		{
+			name:            "single part, no separators",
+			query:           "users",
+			wantAncestors:   nil,
+			wantTableFilter: "users",
+		},
+		{
+			name:            "dotted two-part",
+			query:           "dba.users",
+			wantAncestors:   []string{"dba"},
+			wantTableFilter: "users",
+		},
+		{
+			name:            "dotted three-part",
+			query:           "postgres.auth.users",
+			wantAncestors:   []string{"postgres", "auth"},
+			wantTableFilter: "users",
+		},
+		{
+			name:            "space two-part (legacy syntax)",
+			query:           "auth users",
+			wantAncestors:   []string{"auth"},
+			wantTableFilter: "users",
+		},
+		{
+			name:            "dot takes priority over space when both present",
+			query:           "postgres.auth users",
+			wantAncestors:   []string{"postgres"},
+			wantTableFilter: "auth users",
+		},
+		{
+			name:            "leading/trailing/duplicate dots are ignored",
+			query:           "..dba..users..",
+			wantAncestors:   []string{"dba"},
+			wantTableFilter: "users",
+		},
+		{
+			name:            "only dots",
+			query:           "...",
+			wantAncestors:   nil,
+			wantTableFilter: "",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ancestors, tableFilter := parseSearchQuery(tc.query)
+
+			if len(ancestors) != len(tc.wantAncestors) {
+				t.Fatalf("ancestors = %v, want %v", ancestors, tc.wantAncestors)
+			}
+			for i := range ancestors {
+				if ancestors[i] != tc.wantAncestors[i] {
+					t.Errorf("ancestors[%d] = %q, want %q", i, ancestors[i], tc.wantAncestors[i])
+				}
+			}
+			if tableFilter != tc.wantTableFilter {
+				t.Errorf("tableFilter = %q, want %q", tableFilter, tc.wantTableFilter)
+			}
+		})
+	}
+}
+
+// ── stripColorTags ──────────────────────────────────────────────────────────
+
+func TestStripColorTags_NoTags(t *testing.T) {
+	result := stripColorTags("choir")
+	if result != "choir" {
+		t.Errorf("expected 'choir', got '%s'", result)
+	}
+}
+
+func TestStripColorTags_SingleTag(t *testing.T) {
+	result := stripColorTags("[black:primary]choir")
+	if result != "choir" {
+		t.Errorf("expected 'choir', got '%s'", result)
+	}
+}
+
+func TestStripColorTags_NoSpacesInsideBrackets(t *testing.T) {
+	result := stripColorTags("[red]choir")
+	if result != "choir" {
+		t.Errorf("expected 'choir', got '%s'", result)
+	}
+}
+
+func TestStripColorTags_PlainBracketTextPreserved(t *testing.T) {
+	// If text contains brackets with spaces, it's not a color tag — keep it
+	result := stripColorTags("table [with spaces] name")
+	if result != "table [with spaces] name" {
+		t.Errorf("expected 'table [with spaces] name', got '%s'", result)
+	}
+}
+
+func TestStripColorTags_MultipleColorTags(t *testing.T) {
+	result := stripColorTags("[black:primary][red]choir")
+	if result != "choir" {
+		t.Errorf("expected 'choir', got '%s'", result)
+	}
+}
+
+func TestStripColorTags_NoChangeIfClean(t *testing.T) {
+	inputs := []string{"choir", "choir_members", "users", "my_table"}
+	for _, input := range inputs {
+		result := stripColorTags(input)
+		if result != input {
+			t.Errorf("input '%s': expected no change, got '%s'", input, result)
+		}
+	}
+}
+
+// ── prioritizeResult ────────────────────────────────────────────────────────
+
+func TestPrioritizeResult_ExactMatchWinsOverPrefix(t *testing.T) {
+	exactRank := prioritizeResult("choir", "choir", 0)
+	prefixRank := prioritizeResult("choir", "choir_members", 0)
+
+	if exactRank >= prefixRank {
+		t.Errorf("exact match rank (%d) should be less than prefix rank (%d)", exactRank, prefixRank)
+	}
+}
+
+func TestPrioritizeResult_ShorterPrefixWins(t *testing.T) {
+	rankShort := prioritizeResult("choir", "choir_a", 0)
+	rankLong := prioritizeResult("choir", "choir_abcde", 0)
+
+	if rankShort >= rankLong {
+		t.Errorf("shorter prefix rank (%d) should be less than longer prefix rank (%d)", rankShort, rankLong)
+	}
+}
+
+func TestPrioritizeResult_ExactMatchBeatsEverything(t *testing.T) {
+	pattern := "choir"
+	targets := []string{"choir_a", "choir_longer", "xchoir", "something_choir_suffix", "choir"}
+
+	bestRank := 99999
+	var bestTarget string
+	for _, target := range targets {
+		rank := prioritizeResult(pattern, target, 0)
+		if rank < bestRank {
+			bestRank = rank
+			bestTarget = target
+		}
+	}
+
+	if bestTarget != "choir" {
+		t.Errorf("expected 'choir' to win, but '%s' won with rank %d", bestTarget, bestRank)
+	}
+}
+
+func TestPrioritizeResult_SubstringPenalized(t *testing.T) {
+	prefixRank := prioritizeResult("abc", "abcdef", 0)
+	substrRank := prioritizeResult("abc", "xabcdef", 0)
+
+	if prefixRank >= substrRank {
+		t.Errorf("prefix rank (%d) should be less than substring rank (%d)", prefixRank, substrRank)
+	}
+}
+
+// ── Real-world scenario ─────────────────────────────────────────────────────
+
+func TestSearchRanking_ChoirTableWinsOverChoirPrefixes(t *testing.T) {
+	// Simulates: tables "choir", "choir_members", "choir_events" in the tree.
+	// When user searches "choir", the exact match "choir" must rank #1.
+
+	// Build a minimal tree
+	root := tview.NewTreeNode("-")
+	root.SetReference("-")
+
+	db := tview.NewTreeNode("mydb")
+	db.SetReference("mydb")
+	db.SetExpanded(false)
+	root.AddChild(db)
+
+	tables := []string{"choir_members", "choir_events", "choir", "other_table"}
+	for _, name := range tables {
+		child := tview.NewTreeNode(name)
+		child.SetReference("mydb." + name)
+		child.SetExpanded(false)
+		db.AddChild(child)
+	}
+
+	// Run the ranking logic from the search function, adapted for test
+	pattern := "choir"
+
+	type ranked struct {
+		name string
+		rank int
+	}
+	var results []ranked
+
+	root.Walk(func(node, _ *tview.TreeNode) bool {
+		nodeText := stripColorTags(node.GetText())
+		rank := prioritizeResult(pattern, nodeText, 0)
+		// Only include nodes where the pattern actually matches (contains/substring check)
+		// The real search uses fuzzy.RankMatch first, we skip that here
+		if rank == 0 || nodeText == pattern || len(nodeText) >= len(pattern) {
+			// Include all table nodes for comparison
+			for _, tableName := range tables {
+				if nodeText == tableName {
+					results = append(results, ranked{name: nodeText, rank: rank})
+				}
+			}
+		}
+		return true
+	})
+
+	if len(results) != 4 {
+		t.Fatalf("expected 4 results, got %d", len(results))
+	}
+
+	// Find the minimum rank — should be the exact match "choir"
+	bestIdx := 0
+	for i, r := range results {
+		if r.rank < results[bestIdx].rank {
+			bestIdx = i
+		}
+	}
+	bestName := results[bestIdx].name
+
+	// The real search sorts by rank; the first should be the exact match
+	if bestName != "choir" {
+		t.Errorf("expected 'choir' to be best match, but '%s' got the best rank", bestName)
+	}
+}
+
+func TestSearchRanking_PrioritizeResultIntegration(t *testing.T) {
+	// Simulates the full ranking pipeline with color-tagged node texts
+	// as they would appear during actual use.
+
+	entries := []struct {
+		nodeText string // raw node text, possibly with color tags
+	}{
+		{nodeText: "[black:primary]choir_members"},
+		{nodeText: "[black:primary]choir_events"},
+		{nodeText: "[black:primary]choir"},
+		{nodeText: "[black:primary]other_table"},
+	}
+
+	pattern := "choir"
+	type ranked struct {
+		cleaned string
+		rank    int
+	}
+	var results []ranked
+
+	for _, e := range entries {
+		cleaned := stripColorTags(e.nodeText)
+		rank := prioritizeResult(pattern, cleaned, 0)
+		results = append(results, ranked{cleaned: cleaned, rank: rank})
+	}
+
+	// Find the minimum rank
+	bestIdx := 0
+	for i, r := range results {
+		if r.rank < results[bestIdx].rank {
+			bestIdx = i
+		}
+	}
+
+	if results[bestIdx].cleaned != "choir" {
+		t.Errorf("expected 'choir' to win (rank %d), but '%s' won (rank %d)",
+			prioritizeResult(pattern, "choir", 0),
+			results[bestIdx].cleaned,
+			results[bestIdx].rank,
+		)
+	}
+}
+
+// ── expandAncestors ─────────────────────────────────────────────────────────
+
+func TestExpandAncestors_DeepTree(t *testing.T) {
+	root := tview.NewTreeNode("-")
+	root.SetReference("-")
+
+	db := tview.NewTreeNode("mydb")
+	db.SetReference("mydb")
+	db.Collapse()
+	root.AddChild(db)
+
+	tables := tview.NewTreeNode("tables")
+	tables.SetReference("mydb.tables")
+	tables.Collapse()
+	db.AddChild(tables)
+
+	target := tview.NewTreeNode("users")
+	target.SetReference("mydb.tables.users")
+	target.Collapse()
+	tables.AddChild(target)
+
+	// Initially nothing expanded
+	if db.IsExpanded() {
+		t.Error("db should not be expanded initially")
+	}
+	if tables.IsExpanded() {
+		t.Error("tables should not be expanded initially")
+	}
+
+	expandAncestors(target, root)
+
+	if !db.IsExpanded() {
+		t.Error("db should be expanded after expandAncestors")
+	}
+	if !tables.IsExpanded() {
+		t.Error("tables should be expanded after expandAncestors")
+	}
+	if target.IsExpanded() {
+		t.Error("target node itself should not be expanded")
+	}
+}
+
+func TestExpandAncestors_DirectChild(t *testing.T) {
+	root := tview.NewTreeNode("-")
+	root.SetReference("-")
+
+	child := tview.NewTreeNode("direct")
+	child.SetReference("direct")
+	child.Collapse()
+	root.AddChild(child)
+
+	expandAncestors(child, root)
+	// Direct child of root: root is never expanded (it doesn't have SetExpanded)
+	// child itself shouldn't be expanded; only ancestors
+	if child.IsExpanded() {
+		t.Error("target node itself should not be expanded")
+	}
+}
+
+func TestExpandAncestors_AlreadyExpanded(t *testing.T) {
+	root := tview.NewTreeNode("-")
+	root.SetReference("-")
+
+	db := tview.NewTreeNode("mydb")
+	db.SetReference("mydb")
+	db.SetExpanded(true)
+	root.AddChild(db)
+
+	child := tview.NewTreeNode("table1")
+	child.SetReference("mydb.table1")
+	db.AddChild(child)
+
+	expandAncestors(child, root)
+
+	if !db.IsExpanded() {
+		t.Error("db should remain expanded")
+	}
+}
+
+func TestExpandAncestors_FourLevelTree(t *testing.T) {
+	root := tview.NewTreeNode("-")
+	root.SetReference("-")
+
+	db := tview.NewTreeNode("mydb")
+	db.SetReference("mydb")
+	db.Collapse()
+	root.AddChild(db)
+
+	schema := tview.NewTreeNode("public")
+	schema.SetReference("public")
+	schema.Collapse()
+	db.AddChild(schema)
+
+	section := tview.NewTreeNode("tables")
+	section.SetReference("public.tables")
+	section.Collapse()
+	schema.AddChild(section)
+
+	target := tview.NewTreeNode("users")
+	target.SetReference("public.tables.users")
+	target.Collapse()
+	section.AddChild(target)
+
+	// Initially nothing expanded
+	if db.IsExpanded() {
+		t.Error("db should not be expanded initially")
+	}
+	if schema.IsExpanded() {
+		t.Error("schema should not be expanded initially")
+	}
+	if section.IsExpanded() {
+		t.Error("section should not be expanded initially")
+	}
+
+	expandAncestors(target, root)
+
+	if !db.IsExpanded() {
+		t.Error("db should be expanded after expandAncestors")
+	}
+	if !schema.IsExpanded() {
+		t.Error("schema should be expanded after expandAncestors")
+	}
+	if !section.IsExpanded() {
+		t.Error("section should be expanded after expandAncestors")
+	}
+	// target itself should not be touched by expandAncestors
+	if target.IsExpanded() {
+		t.Error("target node itself should not be expanded by expandAncestors")
+	}
+}
+
+// ── schemaProgrammingMock ───────────────────────────────────────────────────────
+// Implements drivers.Driver with SupportsProgramming()=true and UseSchemas()=true.
+// Used to test buildSchemaTree, addSchemaProgrammingSection, and the new
+// GetTreeNodeData paths.
+
+var _ drivers.Driver = (*schemaProgrammingMock)(nil)
+
+type progressiveTreeDriver struct {
+	schemaProgrammingMock
+	tablesStarted      chan struct{}
+	programmingStart   chan struct{}
+	releaseProgramming chan struct{}
+}
+
+func (driver *progressiveTreeDriver) GetTables(context.Context, string) (map[string][]string, error) {
+	close(driver.tablesStarted)
+	return map[string][]string{"public": {"users"}}, nil
+}
+
+func (driver *progressiveTreeDriver) GetFunctions(context.Context, string) (map[string][]string, error) {
+	close(driver.programmingStart)
+	<-driver.releaseProgramming
+	return map[string][]string{"mydb": {"public.add_user"}}, nil
+}
+
+func (driver *progressiveTreeDriver) GetProcedures(context.Context, string) (map[string][]string, error) {
+	return map[string][]string{"mydb": {"public.cleanup"}}, nil
+}
+
+func (driver *progressiveTreeDriver) GetViews(context.Context, string) (map[string][]string, error) {
+	return map[string][]string{"mydb": {"public.user_view"}}, nil
+}
+
+type schemaProgrammingMock struct{}
+
+func (m *schemaProgrammingMock) Connect(context.Context, string) error          { return nil }
+func (m *schemaProgrammingMock) TestConnection(context.Context, string) error   { return nil }
+func (m *schemaProgrammingMock) GetDatabases(context.Context) ([]string, error) { return nil, nil }
+func (m *schemaProgrammingMock) GetTables(context.Context, string) (map[string][]string, error) {
+	return nil, nil
+}
+func (m *schemaProgrammingMock) GetTableColumns(context.Context, string, string) ([][]string, error) {
+	return nil, nil
+}
+func (m *schemaProgrammingMock) GetConstraints(context.Context, string, string) ([][]string, error) {
+	return nil, nil
+}
+func (m *schemaProgrammingMock) GetForeignKeys(context.Context, string, string) ([][]string, error) {
+	return nil, nil
+}
+func (m *schemaProgrammingMock) GetIndexes(context.Context, string, string) ([][]string, error) {
+	return nil, nil
+}
+func (m *schemaProgrammingMock) GetRecords(context.Context, string, string, string, string, int, int) (drivers.PageResult, error) {
+	return drivers.PageResult{}, nil
+}
+func (m *schemaProgrammingMock) GetEstimatedRowCount(context.Context, string, string) (*int64, error) {
+	return nil, nil
+}
+func (m *schemaProgrammingMock) GetExactRowCount(context.Context, string, string, string) (int64, error) {
+	return 0, nil
+}
+func (m *schemaProgrammingMock) UpdateRecord(context.Context, string, string, string, string, string, string) error {
+	return nil
+}
+func (m *schemaProgrammingMock) DeleteRecord(context.Context, string, string, string, string) error {
+	return nil
+}
+func (m *schemaProgrammingMock) ExecuteDMLStatement(context.Context, string, string) (string, error) {
+	return "", nil
+}
+func (m *schemaProgrammingMock) ExecuteQuery(context.Context, string, string) ([][]string, int, error) {
+	return nil, 0, nil
+}
+func (m *schemaProgrammingMock) ExecutePendingChanges(context.Context, []models.DBDMLChange) error {
+	return nil
+}
+func (m *schemaProgrammingMock) GetProvider() string { return "mock" }
+func (m *schemaProgrammingMock) GetPrimaryKeyColumnNames(context.Context, string, string) ([]string, error) {
+	return nil, nil
+}
+func (m *schemaProgrammingMock) SupportsProgramming() bool { return true }
+func (m *schemaProgrammingMock) UseSchemas() bool          { return true }
+func (m *schemaProgrammingMock) GetFunctions(context.Context, string) (map[string][]string, error) {
+	return nil, nil
+}
+func (m *schemaProgrammingMock) GetProcedures(context.Context, string) (map[string][]string, error) {
+	return nil, nil
+}
+func (m *schemaProgrammingMock) GetViews(context.Context, string) (map[string][]string, error) {
+	return nil, nil
+}
+func (m *schemaProgrammingMock) GetFunctionDefinition(context.Context, string, string) (string, error) {
+	return "", nil
+}
+func (m *schemaProgrammingMock) GetProcedureDefinition(context.Context, string, string) (string, error) {
+	return "", nil
+}
+func (m *schemaProgrammingMock) GetViewDefinition(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func (m *schemaProgrammingMock) FormatArg(arg any, _ models.CellValueType) any {
+	return arg
+}
+func (m *schemaProgrammingMock) FormatArgForQueryString(arg any) string {
+	return fmt.Sprintf("%v", arg)
+}
+func (m *schemaProgrammingMock) FormatReference(reference string) string {
+	return fmt.Sprintf("\"%s\"", reference)
+}
+func (m *schemaProgrammingMock) FormatPlaceholder(index int) string {
+	return fmt.Sprintf("$%d", index)
+}
+func (m *schemaProgrammingMock) DMLChangeToQueryString(models.DBDMLChange) (string, error) {
+	return "", nil
+}
+func (m *schemaProgrammingMock) SetProvider(string) {}
+
+// ── buildSchemaTree tests ───────────────────────────────────────────────────────
+
+func TestInitializeNodesRendersTablesBeforeProgrammingMetadata(t *testing.T) {
+	driver := &progressiveTreeDriver{
+		tablesStarted:      make(chan struct{}),
+		programmingStart:   make(chan struct{}),
+		releaseProgramming: make(chan struct{}),
+	}
+	root := tview.NewTreeNode("-")
+	enrichmentDone := make(chan struct{})
+	tree := &Tree{
+		TreeView: tview.NewTreeView(),
+		state:    &TreeState{},
+		DBDriver: driver,
+		queueUpdateDraw: func(update func()) {
+			update()
+			children := root.GetChildren()
+			if len(children) == 1 && len(children[0].GetChildren()) == 1 && len(children[0].GetChildren()[0].GetChildren()) == 4 {
+				close(enrichmentDone)
+			}
+		},
+	}
+	root.SetReference("-")
+	tree.SetRoot(root)
+
+	tree.InitializeNodes("mydb")
+	select {
+	case <-driver.programmingStart:
+	case <-time.After(time.Second):
+		t.Fatal("programming metadata did not start")
+	}
+
+	children := root.GetChildren()
+	if len(children) != 1 || len(children[0].GetChildren()) != 1 || children[0].GetChildren()[0].GetText() != "public" {
+		t.Fatalf("tree before programming metadata = %v, want database/public table subtree", treeNodeTexts(children))
+	}
+	if tables := children[0].GetChildren()[0].GetChildren(); len(tables) != 1 || tables[0].GetText() != "tables" {
+		t.Fatalf("table subtree before programming metadata = %v, want tables", treeNodeTexts(tables))
+	}
+
+	close(driver.releaseProgramming)
+	select {
+	case <-enrichmentDone:
+	case <-time.After(time.Second):
+		t.Fatal("programming enrichment did not render")
+	}
+	if got := len(children[0].GetChildren()[0].GetChildren()); got != 4 {
+		t.Fatalf("programming enrichment children = %d, want 4", got)
+	}
+}
+
+func TestTreeRefreshKeepsOtherDatabaseNodesVisible(t *testing.T) {
+	tree := &Tree{
+		TreeView: tview.NewTreeView(),
+		state:    &TreeState{},
+		DBDriver: &schemaProgrammingMock{},
+		queueUpdateDraw: func(update func()) {
+			update()
+		},
+	}
+	root := tview.NewTreeNode("-")
+	root.SetReference("-")
+	for _, database := range []string{"db1", "db2"} {
+		node := tview.NewTreeNode(database)
+		node.SetReference(database)
+		root.AddChild(node)
+	}
+	tree.SetRoot(root)
+
+	tree.Refresh("db1")
+	children := root.GetChildren()
+	if len(children) != 2 {
+		t.Fatalf("refreshed databases = %v, want db1 and db2", treeNodeTexts(children))
+	}
+	seen := map[string]bool{}
+	for _, child := range children {
+		seen[child.GetText()] = true
+	}
+	if !seen["db1"] || !seen["db2"] {
+		t.Fatalf("refreshed databases = %v, lost an unrelated database", treeNodeTexts(children))
+	}
+}
+
+func TestMSSQLTreeFiltersSchemasAndKeepsQualifiedTableReferences(t *testing.T) {
+	tree := &Tree{DBDriver: &drivers.MSSQL{}, Schemas: []string{"dbo"}}
+	dbNode := tview.NewTreeNode("test_db")
+	dbNode.SetReference("test_db")
+
+	tree.addTableNodes("test_db", dbNode, map[string][]string{
+		"audit": {"users"},
+		"dbo":   {"users"},
+	})
+
+	children := dbNode.GetChildren()
+	if len(children) != 1 || children[0].GetText() != "dbo" {
+		t.Fatalf("MSSQL tree schemas = %v, want only dbo", treeNodeTexts(children))
+	}
+	tables := children[0].GetChildren()
+	if len(tables) != 1 || tables[0].GetText() != "tables" {
+		t.Fatalf("MSSQL schema children = %v, want tables section", treeNodeTexts(tables))
+	}
+	if got := tables[0].GetChildren()[0].GetReference(); got != "test_db.dbo.tables.users" {
+		t.Fatalf("MSSQL table reference = %v, want schema-qualified reference", got)
+	}
+}
+
+func TestProgressiveTreeAddsTablesBeforeProgrammingObjects(t *testing.T) {
+	tree := &Tree{DBDriver: &schemaProgrammingMock{}}
+	dbNode := tview.NewTreeNode("mydb")
+	dbNode.SetReference("mydb")
+
+	tree.addTableNodes("mydb", dbNode, map[string][]string{"public": {"users"}})
+	if children := dbNode.GetChildren(); len(children) != 1 || children[0].GetText() != "public" {
+		t.Fatalf("table-first tree children = %v, want only public schema", treeNodeTexts(dbNode.GetChildren()))
+	}
+	if got := dbNode.GetChildren()[0].GetChildren()[0].GetText(); got != "tables" {
+		t.Fatalf("table-first schema child = %q, want tables", got)
+	}
+
+	tree.enrichProgrammingNodes(
+		"mydb",
+		dbNode,
+		map[string][]string{"mydb": {"public.add_user"}},
+		map[string][]string{"mydb": {"public.cleanup"}},
+		map[string][]string{"mydb": {"public.user_view"}},
+	)
+
+	schemaChildren := dbNode.GetChildren()[0].GetChildren()
+	if len(schemaChildren) != 4 {
+		t.Fatalf("enriched schema children = %v, want tables/functions/procedures/views", treeNodeTexts(schemaChildren))
+	}
+	for i, want := range []string{"tables", "functions", "procedures", "views"} {
+		if got := schemaChildren[i].GetText(); got != want {
+			t.Errorf("enriched child %d = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestProgressiveTreeProgrammingObjectsRespectSchemaFilter(t *testing.T) {
+	tree := &Tree{DBDriver: &schemaProgrammingMock{}, Schemas: []string{"public"}}
+	dbNode := tview.NewTreeNode("mydb")
+	dbNode.SetReference("mydb")
+
+	tree.addTableNodes("mydb", dbNode, map[string][]string{"public": {"users"}})
+	tree.enrichProgrammingNodes(
+		"mydb",
+		dbNode,
+		map[string][]string{"mydb": {"private.hidden_fn", "public.visible_fn"}},
+		nil,
+		nil,
+	)
+
+	if len(dbNode.GetChildren()) != 1 || dbNode.GetChildren()[0].GetText() != "public" {
+		t.Fatalf("filtered schemas = %v, want only public", treeNodeTexts(dbNode.GetChildren()))
+	}
+	sections := dbNode.GetChildren()[0].GetChildren()
+	if len(sections) != 2 || sections[1].GetText() != "functions" {
+		t.Fatalf("filtered programming sections = %v, want tables/functions", treeNodeTexts(sections))
+	}
+	if got := sections[1].GetChildren()[0].GetText(); got != "visible_fn" {
+		t.Fatalf("filtered function = %q, want visible_fn", got)
+	}
+}
+
+func treeNodeTexts(nodes []*tview.TreeNode) []string {
+	texts := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		texts = append(texts, node.GetText())
+	}
+	return texts
+}
+
+func TestBuildSchemaTree_BasicStructure(t *testing.T) {
+	tree := &Tree{DBDriver: &schemaProgrammingMock{}}
+
+	dbNode := tview.NewTreeNode("mydb")
+	dbNode.SetReference("mydb")
+
+	tables := map[string][]string{"public": {"users", "posts"}}
+	functions := map[string][]string{"mydb": {"public.add_user"}}
+	procedures := map[string][]string{"mydb": {"public.cleanup"}}
+	views := map[string][]string{"mydb": {"public.user_view"}}
+
+	tree.buildSchemaTree("mydb", dbNode, tables, functions, procedures, views)
+
+	// ── db node has 1 child (schema "public") ──
+	children := dbNode.GetChildren()
+	if len(children) != 1 {
+		t.Fatalf("expected 1 child (schema) under db node, got %d", len(children))
+	}
+
+	schemaNode := children[0]
+	if schemaNode.GetText() != "public" {
+		t.Errorf("expected schema node text 'public', got '%s'", schemaNode.GetText())
+	}
+
+	// ── schema node has 4 children: tables, functions, procedures, views ──
+	schemaChildren := schemaNode.GetChildren()
+	if len(schemaChildren) != 4 {
+		t.Fatalf("expected 4 children under schema node, got %d", len(schemaChildren))
+	}
+
+	sectionNames := []string{"tables", "functions", "procedures", "views"}
+	for i, name := range sectionNames {
+		if schemaChildren[i].GetText() != name {
+			t.Errorf("expected section %d text '%s', got '%s'", i, name, schemaChildren[i].GetText())
+		}
+	}
+
+	// ── "tables" section has 2 children, sorted alphabetically: "posts", "users" ──
+	tablesSection := schemaChildren[0]
+	tableChildren := tablesSection.GetChildren()
+	if len(tableChildren) != 2 {
+		t.Fatalf("expected 2 table children, got %d", len(tableChildren))
+	}
+	if tableChildren[0].GetText() != "posts" {
+		t.Errorf("expected first table 'posts', got '%s'", tableChildren[0].GetText())
+	}
+	if tableChildren[1].GetText() != "users" {
+		t.Errorf("expected second table 'users', got '%s'", tableChildren[1].GetText())
+	}
+	if tableChildren[0].GetReference().(string) != "mydb.public.tables.posts" {
+		t.Errorf("expected table reference 'mydb.public.tables.posts', got '%s'", tableChildren[0].GetReference().(string))
+	}
+	if tableChildren[1].GetReference().(string) != "mydb.public.tables.users" {
+		t.Errorf("expected table reference 'mydb.public.tables.users', got '%s'", tableChildren[1].GetReference().(string))
+	}
+
+	// ── "functions" section has 1 child: "add_user" (NOT "public.add_user") ──
+	functionsSection := schemaChildren[1]
+	funcChildren := functionsSection.GetChildren()
+	if len(funcChildren) != 1 {
+		t.Fatalf("expected 1 function child, got %d", len(funcChildren))
+	}
+	if funcChildren[0].GetText() != "add_user" {
+		t.Errorf("expected function 'add_user', got '%s'", funcChildren[0].GetText())
+	}
+	if funcChildren[0].GetReference().(string) != "mydb.public.functions.add_user" {
+		t.Errorf("expected reference 'mydb.public.functions.add_user', got '%s'", funcChildren[0].GetReference().(string))
+	}
+
+	// ── "procedures" section has 1 child: "cleanup" ──
+	proceduresSection := schemaChildren[2]
+	procChildren := proceduresSection.GetChildren()
+	if len(procChildren) != 1 {
+		t.Fatalf("expected 1 procedure child, got %d", len(procChildren))
+	}
+	if procChildren[0].GetText() != "cleanup" {
+		t.Errorf("expected procedure 'cleanup', got '%s'", procChildren[0].GetText())
+	}
+	if procChildren[0].GetReference().(string) != "mydb.public.procedures.cleanup" {
+		t.Errorf("expected reference 'mydb.public.procedures.cleanup', got '%s'", procChildren[0].GetReference().(string))
+	}
+
+	// ── "views" section has 1 child: "user_view" ──
+	viewsSection := schemaChildren[3]
+	viewChildren := viewsSection.GetChildren()
+	if len(viewChildren) != 1 {
+		t.Fatalf("expected 1 view child, got %d", len(viewChildren))
+	}
+	if viewChildren[0].GetText() != "user_view" {
+		t.Errorf("expected view 'user_view', got '%s'", viewChildren[0].GetText())
+	}
+	if viewChildren[0].GetReference().(string) != "mydb.public.views.user_view" {
+		t.Errorf("expected reference 'mydb.public.views.user_view', got '%s'", viewChildren[0].GetReference().(string))
+	}
+}
+
+func TestBuildSchemaTree_TablesAreSorted(t *testing.T) {
+	tree := &Tree{DBDriver: &schemaProgrammingMock{}}
+
+	dbNode := tview.NewTreeNode("mydb")
+	dbNode.SetReference("mydb")
+
+	// Unsorted on purpose: drivers do not guarantee table order.
+	tables := map[string][]string{"public": {"zebra", "users", "posts", "alpha"}}
+
+	tree.buildSchemaTree("mydb", dbNode, tables, nil, nil, nil)
+
+	children := dbNode.GetChildren()
+	if len(children) != 1 {
+		t.Fatalf("expected 1 schema child, got %d", len(children))
+	}
+
+	tableChildren := children[0].GetChildren()[0].GetChildren()
+	want := []string{"alpha", "posts", "users", "zebra"}
+	if len(tableChildren) != len(want) {
+		t.Fatalf("expected %d tables, got %d", len(want), len(tableChildren))
+	}
+	for i, name := range want {
+		if tableChildren[i].GetText() != name {
+			t.Errorf("table %d: expected %q, got %q", i, name, tableChildren[i].GetText())
+		}
+	}
+}
+
+// TestBuildSchemaTree_SchemaWithOnlyFunctions validates that schemas containing
+// only programming objects (functions/procedures/views) but no tables still
+// appear in the tree. On this branch, buildSchemaTree collects schema names
+// from all maps (tables + functions/procedures/views), so "api" appears even
+// though it has no tables.
+func TestBuildSchemaTree_SchemaWithOnlyFunctions(t *testing.T) {
+	tree := &Tree{DBDriver: &schemaProgrammingMock{}}
+
+	dbNode := tview.NewTreeNode("mydb")
+	dbNode.SetReference("mydb")
+
+	tables := map[string][]string{"public": {"users"}}
+	functions := map[string][]string{"mydb": {"api.get_data"}}
+	procedures := map[string][]string{}
+	views := map[string][]string{}
+
+	tree.buildSchemaTree("mydb", dbNode, tables, functions, procedures, views)
+
+	children := dbNode.GetChildren()
+
+	// Expect both "api" (from functions) and "public" (from tables)
+	if len(children) != 2 {
+		t.Fatalf("expected 2 schema children (api, public), got %d", len(children))
+	}
+
+	// Sorted keys: ["api", "public"] — "api" comes first alphabetically
+	apiNode := children[0]
+	if apiNode.GetText() != "api" {
+		t.Errorf("expected first schema 'api', got '%s'", apiNode.GetText())
+	}
+
+	// "api" has a "tables" section (created unconditionally when supportsProgramming)
+	// plus a "functions" section with "get_data"
+	apiChildren := apiNode.GetChildren()
+	if len(apiChildren) != 2 {
+		t.Fatalf("expected 2 children under 'api' (tables + functions), got %d", len(apiChildren))
+	}
+	if apiChildren[0].GetText() != "tables" {
+		t.Errorf("expected 'tables' section under 'api', got '%s'", apiChildren[0].GetText())
+	}
+	if apiChildren[1].GetText() != "functions" {
+		t.Errorf("expected 'functions' section under 'api', got '%s'", apiChildren[1].GetText())
+	}
+
+	// "api" tables section should have no children (no tables for "api")
+	if len(apiChildren[0].GetChildren()) != 0 {
+		t.Errorf("expected no tables under 'api', got %d", len(apiChildren[0].GetChildren()))
+	}
+
+	// Verify the function item
+	funcSection := apiChildren[1]
+	funcItems := funcSection.GetChildren()
+	if len(funcItems) != 1 {
+		t.Fatalf("expected 1 function under api, got %d", len(funcItems))
+	}
+	if funcItems[0].GetText() != "get_data" {
+		t.Errorf("expected function 'get_data', got '%s'", funcItems[0].GetText())
+	}
+
+	// Second child: "public" has tables but no matching functions/procedures/views
+	publicNode := children[1]
+	if publicNode.GetText() != "public" {
+		t.Errorf("expected second schema 'public', got '%s'", publicNode.GetText())
+	}
+	publicChildren := publicNode.GetChildren()
+	if len(publicChildren) != 1 {
+		t.Fatalf("expected 1 child under 'public' (just tables), got %d", len(publicChildren))
+	}
+	if publicChildren[0].GetText() != "tables" {
+		t.Errorf("expected 'tables' section under 'public', got '%s'", publicChildren[0].GetText())
+	}
+	if len(publicChildren[0].GetChildren()) != 1 {
+		t.Fatalf("expected 1 table under 'public', got %d", len(publicChildren[0].GetChildren()))
+	}
+	if publicChildren[0].GetChildren()[0].GetText() != "users" {
+		t.Errorf("expected table 'users', got '%s'", publicChildren[0].GetChildren()[0].GetText())
+	}
+}
+
+// ── addSchemaProgrammingSection tests ───────────────────────────────────────────
+
+func TestAddSchemaProgrammingSection_EmptySection(t *testing.T) {
+	tree := &Tree{DBDriver: &schemaProgrammingMock{}}
+
+	schemaNode := tview.NewTreeNode("public")
+	schemaNode.SetReference("public")
+
+	// programmingMap with no items for the "public" schema
+	programmingMap := map[string][]string{"mydb": {"other_schema.some_func"}}
+
+	tree.addSchemaProgrammingSection(schemaNode, "mydb", "public", "functions", programmingMap)
+
+	// No child should have been added because no items matched the prefix "public."
+	if len(schemaNode.GetChildren()) != 0 {
+		t.Errorf("expected no children added for empty section, got %d", len(schemaNode.GetChildren()))
+	}
+}
+
+// ── GetTreeNodeData schema programming tests ────────────────────────────────────
+
+func TestGetTreeNodeDataSchemaProgramming_SectionHeader(t *testing.T) {
+	tree := &Tree{DBDriver: &schemaProgrammingMock{}}
+
+	node := tview.NewTreeNode("functions")
+	node.SetReference("mydb.public.functions")
+
+	data := tree.GetTreeNodeData(node)
+
+	if data.Type != NodeTypeSection {
+		t.Errorf("expected NodeTypeSection, got %v", data.Type)
+	}
+	if data.Database != "mydb" {
+		t.Errorf("expected Database 'mydb', got '%s'", data.Database)
+	}
+	if data.Schema != "public" {
+		t.Errorf("expected Schema 'public', got '%s'", data.Schema)
+	}
+	if data.Name != "functions" {
+		t.Errorf("expected Name 'functions', got '%s'", data.Name)
+	}
+}
+
+func TestGetTreeNodeDataSchemaProgramming_ItemNode(t *testing.T) {
+	tree := &Tree{DBDriver: &schemaProgrammingMock{}}
+
+	node := tview.NewTreeNode("add_user")
+	node.SetReference("mydb.public.functions.add_user")
+
+	data := tree.GetTreeNodeData(node)
+
+	if data.Type != NodeTypeFunction {
+		t.Errorf("expected NodeTypeFunction, got %v", data.Type)
+	}
+	if data.Database != "mydb" {
+		t.Errorf("expected Database 'mydb', got '%s'", data.Database)
+	}
+	if data.Schema != "public" {
+		t.Errorf("expected Schema 'public', got '%s'", data.Schema)
+	}
+	if data.Name != "add_user" {
+		t.Errorf("expected Name 'add_user', got '%s'", data.Name)
+	}
+}
+
+func TestGetTreeNodeDataSchemaProgramming_TableItem(t *testing.T) {
+	tree := &Tree{DBDriver: &schemaProgrammingMock{}}
+
+	node := tview.NewTreeNode("users")
+	node.SetReference("mydb.public.tables.users")
+
+	data := tree.GetTreeNodeData(node)
+
+	if data.Type != NodeTypeTable {
+		t.Errorf("expected NodeTypeTable, got %v", data.Type)
+	}
+	if data.Database != "mydb" {
+		t.Errorf("expected Database 'mydb', got '%s'", data.Database)
+	}
+	if data.Schema != "public" {
+		t.Errorf("expected Schema 'public', got '%s'", data.Schema)
+	}
+	if data.Name != "users" {
+		t.Errorf("expected Name 'users', got '%s'", data.Name)
+	}
+}
+
+// ── search ancestor-walk tests ─────────────────────────────────────────────────
+
+func TestSearch_TwoPartFindsDeepNodeThroughSectionHeaders(t *testing.T) {
+	// Regression: two-part search ("auth users") must walk up the ancestor chain
+	// through section headers (tables/functions) to find the matching schema.
+	// Bug was that it only checked the immediate parent.
+	tree := &Tree{
+		TreeView: tview.NewTreeView(),
+		state:    &TreeState{},
+	}
+	root := tview.NewTreeNode("-")
+	root.SetReference("-")
+	tree.SetRoot(root)
+
+	// Build: postgres > auth > tables > users, sessions
+	//                   > functions > validate_user
+	db := tview.NewTreeNode("postgres")
+	db.SetReference("postgres")
+	db.Collapse()
+	root.AddChild(db)
+
+	schema := tview.NewTreeNode("auth")
+	schema.SetReference("auth")
+	schema.Collapse()
+	db.AddChild(schema)
+
+	tablesSection := tview.NewTreeNode("tables")
+	tablesSection.SetReference("auth.tables")
+	tablesSection.Collapse()
+	schema.AddChild(tablesSection)
+
+	usersNode := tview.NewTreeNode("users")
+	usersNode.SetReference("postgres.auth.tables.users")
+	usersNode.Collapse()
+	tablesSection.AddChild(usersNode)
+
+	sessionsNode := tview.NewTreeNode("sessions")
+	sessionsNode.SetReference("postgres.auth.tables.sessions")
+	sessionsNode.Collapse()
+	tablesSection.AddChild(sessionsNode)
+
+	functionsSection := tview.NewTreeNode("functions")
+	functionsSection.SetReference("auth.functions")
+	functionsSection.Collapse()
+	schema.AddChild(functionsSection)
+
+	validateFunc := tview.NewTreeNode("validate_user")
+	validateFunc.SetReference("postgres.auth.functions.validate_user")
+	validateFunc.Collapse()
+	functionsSection.AddChild(validateFunc)
+
+	tree.search("auth users")
+
+	if len(tree.state.searchFoundNodes) == 0 {
+		t.Fatal("expected search results, got none")
+	}
+
+	best := tree.state.searchFoundNodes[0]
+	if best.GetText() != "users" {
+		t.Errorf("expected best match 'users', got '%s'", best.GetText())
+	}
+
+	// Verify "users" is in results somewhere
+	found := false
+	for _, n := range tree.state.searchFoundNodes {
+		if n.GetText() == "users" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'users' to be in search results")
+	}
+}
+
+func TestSearch_SinglePartWorksNormally(t *testing.T) {
+	// Single-part search should still work without ancestor walking.
+	tree := &Tree{
+		TreeView: tview.NewTreeView(),
+		state:    &TreeState{},
+	}
+	root := tview.NewTreeNode("-")
+	root.SetReference("-")
+	tree.SetRoot(root)
+
+	db := tview.NewTreeNode("mydb")
+	db.SetReference("mydb")
+	root.AddChild(db)
+
+	tables := tview.NewTreeNode("tables")
+	tables.SetReference("mydb.tables")
+	db.AddChild(tables)
+
+	users := tview.NewTreeNode("users")
+	users.SetReference("mydb.tables.users")
+	tables.AddChild(users)
+
+	orders := tview.NewTreeNode("orders")
+	orders.SetReference("mydb.tables.orders")
+	tables.AddChild(orders)
+
+	tree.search("users")
+
+	if len(tree.state.searchFoundNodes) == 0 {
+		t.Fatal("expected search results, got none")
+	}
+
+	best := tree.state.searchFoundNodes[0]
+	if best.GetText() != "users" {
+		t.Errorf("expected best match 'users', got '%s'", best.GetText())
+	}
+}
+
+func buildTwoDatabaseTreeWithSameTableName() *Tree {
+	// Build:
+	//   dbA > tables > users, orders
+	//   dbB > tables > users, invoices
+	// Both databases have a "users" table so an unscoped search for "users"
+	// would legitimately match both. A dotted "dbA.users" search must only
+	// return dbA's node.
+	tree := &Tree{
+		TreeView: tview.NewTreeView(),
+		state:    &TreeState{},
+	}
+	root := tview.NewTreeNode("-")
+	root.SetReference("-")
+	tree.SetRoot(root)
+
+	dbA := tview.NewTreeNode("dbA")
+	dbA.SetReference("dbA")
+	root.AddChild(dbA)
+
+	dbATables := tview.NewTreeNode("tables")
+	dbATables.SetReference("dbA.tables")
+	dbA.AddChild(dbATables)
+
+	dbAUsers := tview.NewTreeNode("users")
+	dbAUsers.SetReference("dbA.tables.users")
+	dbATables.AddChild(dbAUsers)
+
+	dbAOrders := tview.NewTreeNode("orders")
+	dbAOrders.SetReference("dbA.tables.orders")
+	dbATables.AddChild(dbAOrders)
+
+	dbB := tview.NewTreeNode("dbB")
+	dbB.SetReference("dbB")
+	root.AddChild(dbB)
+
+	dbBTables := tview.NewTreeNode("tables")
+	dbBTables.SetReference("dbB.tables")
+	dbB.AddChild(dbBTables)
+
+	dbBUsers := tview.NewTreeNode("users")
+	dbBUsers.SetReference("dbB.tables.users")
+	dbBTables.AddChild(dbBUsers)
+
+	dbBInvoices := tview.NewTreeNode("invoices")
+	dbBInvoices.SetReference("dbB.tables.invoices")
+	dbBTables.AddChild(dbBInvoices)
+
+	return tree
+}
+
+func TestSearch_DottedTwoPartScopesToDatabase(t *testing.T) {
+	tree := buildTwoDatabaseTreeWithSameTableName()
+
+	tree.search("dbA.users")
+
+	if len(tree.state.searchFoundNodes) == 0 {
+		t.Fatal("expected search results, got none")
+	}
+
+	for _, n := range tree.state.searchFoundNodes {
+		ref, _ := n.GetReference().(string)
+		if strings.HasPrefix(ref, "dbB") {
+			t.Errorf("dotted search 'dbA.users' must not match nodes under dbB, but matched %q (ref=%s)", n.GetText(), ref)
+		}
+	}
+
+	best := tree.state.searchFoundNodes[0]
+	bestRef, _ := best.GetReference().(string)
+	if bestRef != "dbA.tables.users" {
+		t.Errorf("expected best match ref 'dbA.tables.users', got '%s' (text=%s)", bestRef, best.GetText())
+	}
+}
+
+func TestSearch_DottedTwoPartOtherDatabaseScopesCorrectly(t *testing.T) {
+	tree := buildTwoDatabaseTreeWithSameTableName()
+
+	tree.search("dbB.users")
+
+	if len(tree.state.searchFoundNodes) == 0 {
+		t.Fatal("expected search results, got none")
+	}
+
+	for _, n := range tree.state.searchFoundNodes {
+		ref, _ := n.GetReference().(string)
+		if strings.HasPrefix(ref, "dbA") {
+			t.Errorf("dotted search 'dbB.users' must not match nodes under dbA, but matched %q (ref=%s)", n.GetText(), ref)
+		}
+	}
+
+	best := tree.state.searchFoundNodes[0]
+	bestRef, _ := best.GetReference().(string)
+	if bestRef != "dbB.tables.users" {
+		t.Errorf("expected best match ref 'dbB.tables.users', got '%s' (text=%s)", bestRef, best.GetText())
+	}
+}
+
+func TestSearch_DottedThreePartScopesToDatabaseAndSchema(t *testing.T) {
+	// Build: postgres > auth > tables > users
+	//                 > billing > tables > users
+	// Same table name "users" under two different schemas in the same
+	// database. A three-part dotted search must disambiguate by schema too.
+	tree := &Tree{
+		TreeView: tview.NewTreeView(),
+		state:    &TreeState{},
+	}
+	root := tview.NewTreeNode("-")
+	root.SetReference("-")
+	tree.SetRoot(root)
+
+	db := tview.NewTreeNode("postgres")
+	db.SetReference("postgres")
+	root.AddChild(db)
+
+	authSchema := tview.NewTreeNode("auth")
+	authSchema.SetReference("auth")
+	db.AddChild(authSchema)
+
+	authTables := tview.NewTreeNode("tables")
+	authTables.SetReference("postgres.auth.tables")
+	authSchema.AddChild(authTables)
+
+	authUsers := tview.NewTreeNode("users")
+	authUsers.SetReference("postgres.auth.tables.users")
+	authTables.AddChild(authUsers)
+
+	billingSchema := tview.NewTreeNode("billing")
+	billingSchema.SetReference("billing")
+	db.AddChild(billingSchema)
+
+	billingTables := tview.NewTreeNode("tables")
+	billingTables.SetReference("postgres.billing.tables")
+	billingSchema.AddChild(billingTables)
+
+	billingUsers := tview.NewTreeNode("users")
+	billingUsers.SetReference("postgres.billing.tables.users")
+	billingTables.AddChild(billingUsers)
+
+	tree.search("postgres.auth.users")
+
+	if len(tree.state.searchFoundNodes) == 0 {
+		t.Fatal("expected search results, got none")
+	}
+
+	best := tree.state.searchFoundNodes[0]
+	bestRef, _ := best.GetReference().(string)
+	if bestRef != "postgres.auth.tables.users" {
+		t.Errorf("expected best match ref 'postgres.auth.tables.users', got '%s' (text=%s)", bestRef, best.GetText())
+	}
+
+	for _, n := range tree.state.searchFoundNodes {
+		ref, _ := n.GetReference().(string)
+		if ref == "postgres.billing.tables.users" {
+			t.Errorf("three-part dotted search 'postgres.auth.users' must not match billing schema's users table")
+		}
+	}
+}
+
+func TestSearch_SpaceSeparatedTwoPartStillWorks(t *testing.T) {
+	// Regression guard: existing space-based two-part syntax must keep
+	// working exactly as before the dotted-path support was added.
+	tree := &Tree{
+		TreeView: tview.NewTreeView(),
+		state:    &TreeState{},
+	}
+	root := tview.NewTreeNode("-")
+	root.SetReference("-")
+	tree.SetRoot(root)
+
+	db := tview.NewTreeNode("postgres")
+	db.SetReference("postgres")
+	root.AddChild(db)
+
+	schema := tview.NewTreeNode("auth")
+	schema.SetReference("auth")
+	db.AddChild(schema)
+
+	tablesSection := tview.NewTreeNode("tables")
+	tablesSection.SetReference("auth.tables")
+	schema.AddChild(tablesSection)
+
+	usersNode := tview.NewTreeNode("users")
+	usersNode.SetReference("postgres.auth.tables.users")
+	tablesSection.AddChild(usersNode)
+
+	tree.search("auth users")
+
+	if len(tree.state.searchFoundNodes) == 0 {
+		t.Fatal("expected search results, got none")
+	}
+
+	best := tree.state.searchFoundNodes[0]
+	if best.GetText() != "users" {
+		t.Errorf("expected best match 'users', got '%s'", best.GetText())
+	}
+}
+
+// ── exact-match collapse for fully-qualified queries ────────────────────────
+
+// buildSchemaTreeWithNearNameTables builds:
+//
+//	dados > dd > tables > dad, dado, cidade
+//
+// "dad" and "dado" are deliberately near-name so bare fuzzy matching on the
+// final segment would rank both, which is exactly the behavior a fully
+// qualified query must collapse away.
+func buildSchemaTreeWithNearNameTables() *Tree {
+	tree := &Tree{
+		TreeView: tview.NewTreeView(),
+		state:    &TreeState{},
+	}
+	root := tview.NewTreeNode("-")
+	root.SetReference("-")
+	tree.SetRoot(root)
+
+	db := tview.NewTreeNode("dados")
+	db.SetReference("dados")
+	root.AddChild(db)
+
+	schema := tview.NewTreeNode("dd")
+	schema.SetReference("dd")
+	db.AddChild(schema)
+
+	tablesSection := tview.NewTreeNode("tables")
+	tablesSection.SetReference("dados.dd.tables")
+	schema.AddChild(tablesSection)
+
+	for _, name := range []string{"dad", "dado", "cidade"} {
+		n := tview.NewTreeNode(name)
+		n.SetReference(fmt.Sprintf("dados.dd.tables.%s", name))
+		tablesSection.AddChild(n)
+	}
+
+	return tree
+}
+
+func TestSearch_DottedThreePartExactMatchCollapsesNearNameSiblings(t *testing.T) {
+	// Regression for the reported UX gap: once the full qualified path
+	// matches an existing node exactly, near-name siblings ("dado") must not
+	// also appear in the result list alongside the exact hit ("dad").
+	tree := buildSchemaTreeWithNearNameTables()
+
+	tree.search("dados.dd.dad")
+
+	if len(tree.state.searchFoundNodes) != 1 {
+		t.Fatalf("expected exactly 1 result for exact qualified match, got %d", len(tree.state.searchFoundNodes))
+	}
+
+	best := tree.state.searchFoundNodes[0]
+	bestRef, _ := best.GetReference().(string)
+	if bestRef != "dados.dd.tables.dad" {
+		t.Errorf("expected exact match ref 'dados.dd.tables.dad', got '%s' (text=%s)", bestRef, best.GetText())
+	}
+}
+
+func TestSearch_DottedThreePartPartialSegmentStillFuzzyMatches(t *testing.T) {
+	// Mid-typing UX guard: when the final segment has no exact match yet,
+	// fuzzy matching across the ancestor-scoped set must still work so the
+	// user sees candidates while still typing.
+	tree := buildSchemaTreeWithNearNameTables()
+
+	tree.search("dados.dd.da")
+
+	if len(tree.state.searchFoundNodes) < 2 {
+		t.Fatalf("expected fuzzy matches for partial segment 'da', got %d result(s)", len(tree.state.searchFoundNodes))
+	}
+
+	foundNames := map[string]bool{}
+	for _, n := range tree.state.searchFoundNodes {
+		foundNames[n.GetText()] = true
+	}
+	if !foundNames["dad"] || !foundNames["dado"] {
+		t.Errorf("expected both 'dad' and 'dado' in partial-segment fuzzy results, got %v", foundNames)
+	}
+}
+
+func TestSearch_SpaceSeparatedExactMatchCollapsesNearNameSiblings(t *testing.T) {
+	// Exact-match collapse must apply uniformly regardless of separator
+	// syntax (dotted vs. legacy space-separated), since both funnel through
+	// the same ancestor-filter mechanism.
+	tree := buildSchemaTreeWithNearNameTables()
+
+	tree.search("dd dad")
+
+	if len(tree.state.searchFoundNodes) != 1 {
+		t.Fatalf("expected exactly 1 result for exact qualified match via space syntax, got %d", len(tree.state.searchFoundNodes))
+	}
+
+	best := tree.state.searchFoundNodes[0]
+	if best.GetText() != "dad" {
+		t.Errorf("expected exact match 'dad', got '%s'", best.GetText())
+	}
+}
+
+func TestSearch_SinglePartExactMatchDoesNotCollapseSiblings(t *testing.T) {
+	// Single-part (unqualified) search must keep its existing fuzzy behavior
+	// unchanged: exact-collapse only triggers once the user has qualified
+	// the query with at least one ancestor filter.
+	tree := buildSchemaTreeWithNearNameTables()
+
+	tree.search("dad")
+
+	foundNames := map[string]bool{}
+	for _, n := range tree.state.searchFoundNodes {
+		foundNames[n.GetText()] = true
+	}
+	if !foundNames["dad"] {
+		t.Errorf("expected exact match 'dad' to be present, got %v", foundNames)
+	}
+	// "dado" fuzzy-matches "dad" too (prefix match); unqualified search
+	// behavior must remain unchanged by this increment.
+	if !foundNames["dado"] {
+		t.Errorf("expected unqualified search to keep pre-existing fuzzy behavior (should still include 'dado'), got %v", foundNames)
+	}
+}
+
+func (m *schemaProgrammingMock) GetReferencingTables(context.Context, string, string) ([][]string, error) {
+	return nil, nil
+}

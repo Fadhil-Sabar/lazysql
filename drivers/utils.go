@@ -1,0 +1,369 @@
+package drivers
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/jorgerojas26/lazysql/helpers/logger"
+	"github.com/jorgerojas26/lazysql/models"
+)
+
+func pageSizeAndFetchLimit(limit int) (pageSize, fetchLimit int) {
+	pageSize = limit
+	if pageSize <= 0 {
+		pageSize = DefaultRowLimit
+	}
+	return pageSize, pageSize + 1
+}
+
+func newPageResult(rows [][]string, query string, pageSize int) PageResult {
+	if pageSize <= 0 {
+		pageSize = DefaultRowLimit
+	}
+	if len(rows) <= 1 {
+		return PageResult{Rows: rows, Query: query}
+	}
+
+	dataRows := rows[1:]
+	hasNextPage := len(dataRows) > pageSize
+	if !hasNextPage {
+		return PageResult{Rows: rows, Query: query}
+	}
+
+	visibleRows := make([][]string, 0, pageSize+1)
+	visibleRows = append(visibleRows, rows[0])
+	visibleRows = append(visibleRows, dataRows[:pageSize]...)
+
+	return PageResult{
+		Rows:        visibleRows,
+		Query:       query,
+		HasNextPage: true,
+	}
+}
+
+func queriesInTransaction(ctx context.Context, db *sql.DB, queries []models.Query) (err error) {
+	ctx = contextOrBackground(ctx)
+	trx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		rErr := trx.Rollback()
+		// sql.ErrTxDone is returned when trx.Commit was already called
+		if !errors.Is(rErr, sql.ErrTxDone) {
+			err = errors.Join(err, rErr)
+		}
+	}()
+
+	for _, query := range queries {
+		if _, err := trx.ExecContext(ctx, query.Query, query.Args...); err != nil {
+			return err
+		}
+	}
+	if err := trx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func buildInsertQueryString(formattedTableName string, columns []string, values []any, driver Driver) string {
+	sanitizedValues := make([]string, len(values))
+
+	for i, v := range values {
+		sanitizedValues[i] = fmt.Sprintf("%v", driver.FormatArgForQueryString(v))
+	}
+
+	queryStr := "INSERT INTO " + formattedTableName
+	queryStr += fmt.Sprintf(" (%s) VALUES (%s)", strings.Join(columns, ", "), strings.Join(sanitizedValues, ", "))
+
+	return queryStr
+}
+
+func buildInsertQuery(formattedTableName string, values []models.CellValue, driver Driver) models.Query {
+	cols := make([]string, 0, len(values))
+	args := make([]any, 0, len(values))
+	placeholders := make([]string, 0, len(values))
+
+	index := 1
+
+	for _, value := range values {
+		if value.Type != models.Default {
+			cols = append(cols, driver.FormatReference(value.Column))
+		}
+
+		if value.Value != nil && value.Type != models.Default {
+			placeholders = append(placeholders, driver.FormatPlaceholder(index))
+			args = append(args, driver.FormatArg(value.Value, value.Type))
+			index++
+		}
+	}
+
+	queryStr := "INSERT INTO " + formattedTableName
+	queryStr += fmt.Sprintf(" (%s) VALUES (%s)", strings.Join(cols, ", "), strings.Join(placeholders, ", "))
+
+	newQuery := models.Query{
+		Query: queryStr,
+		Args:  args,
+	}
+
+	return newQuery
+}
+
+func buildUpdateQueryString(sanitizedTableName string, colNames []string, args []any, primaryKeyInfo []models.PrimaryKeyInfo, driver Driver) string {
+	queryStr := "UPDATE " + sanitizedTableName
+
+	sanitizedColNames := make([]string, len(colNames))
+	for i, colName := range colNames {
+		sanitizedColNames[i] = driver.FormatReference(colName)
+	}
+
+	sanitizedPrimaryKeyInfo := make([]models.PrimaryKeyInfo, len(primaryKeyInfo))
+	for i, pki := range primaryKeyInfo {
+		sanitizedPrimaryKeyInfo[i] = models.PrimaryKeyInfo{
+			Name:  driver.FormatReference(pki.Name),
+			Value: driver.FormatArgForQueryString(pki.Value),
+		}
+	}
+
+	sanitizedArgs := make([]any, len(args))
+	for i, arg := range args {
+		sanitizedArgs[i] = driver.FormatArgForQueryString(arg)
+	}
+
+	for i, sanitizedColName := range sanitizedColNames {
+		if i == 0 {
+			queryStr += fmt.Sprintf(" SET %s = %s", sanitizedColName, sanitizedArgs[i])
+		} else {
+			queryStr += fmt.Sprintf(", %s = %s", sanitizedColName, sanitizedArgs[i])
+		}
+	}
+
+	for i, sanitizedPki := range sanitizedPrimaryKeyInfo {
+		if i == 0 {
+			queryStr += fmt.Sprintf(" WHERE %s = %s", sanitizedPki.Name, sanitizedPki.Value)
+		} else {
+			queryStr += fmt.Sprintf(" AND %s = %s", sanitizedPki.Name, sanitizedPki.Value)
+		}
+	}
+
+	return queryStr
+}
+
+func buildUpdateQuery(sanitizedTableName string, values []models.CellValue, primaryKeyInfo []models.PrimaryKeyInfo, driver Driver) models.Query {
+	if len(primaryKeyInfo) == 0 {
+		return models.Query{Query: "", Args: nil}
+	}
+
+	argsWithoutDefaults := []models.CellValue{}
+
+	for _, arg := range values {
+		if arg.Type != models.Default {
+			argsWithoutDefaults = append(argsWithoutDefaults, arg)
+		}
+	}
+
+	placeholders := buildPlaceholders(values, driver)
+
+	sanitizedCols := []string{}
+	for _, value := range values {
+		sanitizedCols = append(sanitizedCols, driver.FormatReference(value.Column))
+	}
+
+	sanitizedArgs := make([]any, len(argsWithoutDefaults))
+	for i, arg := range argsWithoutDefaults {
+		if arg.Type != models.Default {
+			sanitizedArgs[i] = driver.FormatArg(arg.Value, arg.Type)
+		}
+	}
+
+	sanitizedPrimaryKeyInfo := make([]models.PrimaryKeyInfo, len(primaryKeyInfo))
+	for i, primaryKey := range primaryKeyInfo {
+		sanitizedPrimaryKeyInfo[i] = models.PrimaryKeyInfo{
+			Name:  driver.FormatReference(primaryKey.Name),
+			Value: primaryKey.Value,
+		}
+	}
+
+	queryStr := "UPDATE " + sanitizedTableName
+
+	for i, sanitizedCol := range sanitizedCols {
+		placeholder := placeholders[i]
+		reference := sanitizedCol
+		if i == 0 {
+			queryStr += fmt.Sprintf(" SET %s = %s", reference, placeholder)
+		} else {
+			queryStr += fmt.Sprintf(", %s = %s", reference, placeholder)
+		}
+	}
+
+	for i, sanitizedPki := range sanitizedPrimaryKeyInfo {
+		placeholder := driver.FormatPlaceholder(len(argsWithoutDefaults) + i + 1)
+		reference := sanitizedPki.Name
+
+		if i == 0 {
+			queryStr += fmt.Sprintf(" WHERE %s = %s", reference, placeholder)
+		} else {
+			queryStr += fmt.Sprintf(" AND %s = %s", reference, placeholder)
+		}
+		sanitizedArgs = append(sanitizedArgs, sanitizedPki.Value)
+	}
+
+	logger.Info("buildUpdateQueryString", map[string]any{"queryStr": queryStr, "sanitizedArgs": sanitizedArgs})
+
+	newQuery := models.Query{
+		Query: queryStr,
+		Args:  sanitizedArgs,
+	}
+
+	return newQuery
+}
+
+func buildDeleteQueryString(sanitizedTableName string, primaryKeyInfo []models.PrimaryKeyInfo, driver Driver) string {
+	queryStr := "DELETE FROM " + sanitizedTableName
+
+	sanitizedPrimaryKeyInfo := make([]models.PrimaryKeyInfo, len(primaryKeyInfo))
+	for i, pki := range primaryKeyInfo {
+		sanitizedPrimaryKeyInfo[i] = models.PrimaryKeyInfo{
+			Name:  driver.FormatReference(pki.Name),
+			Value: driver.FormatArgForQueryString(pki.Value),
+		}
+	}
+
+	for i, sanitizedPki := range sanitizedPrimaryKeyInfo {
+		if i == 0 {
+			queryStr += fmt.Sprintf(" WHERE %s = %s", sanitizedPki.Name, sanitizedPki.Value)
+		} else {
+			queryStr += fmt.Sprintf(" AND %s = %s", sanitizedPki.Name, sanitizedPki.Value)
+		}
+	}
+
+	return queryStr
+}
+
+func buildDeleteQuery(formattedTableName string, primaryKeyInfo []models.PrimaryKeyInfo, driver Driver) models.Query {
+	if len(primaryKeyInfo) == 0 {
+		return models.Query{Query: "", Args: nil}
+	}
+
+	queryStr := "DELETE FROM " + formattedTableName
+	args := make([]any, len(primaryKeyInfo))
+
+	sanitizedPrimaryKeyInfo := sanitizePrimaryKeyInfo(primaryKeyInfo, driver)
+
+	for i, sanitizedPki := range sanitizedPrimaryKeyInfo {
+		placeholder := driver.FormatPlaceholder(i + 1)
+		reference := sanitizedPki.Name
+
+		if i == 0 {
+			queryStr += fmt.Sprintf(" WHERE %s = %s", reference, placeholder)
+		} else {
+			queryStr += fmt.Sprintf(" AND %s = %s", reference, placeholder)
+		}
+		args[i] = sanitizedPki.Value
+	}
+
+	return models.Query{
+		Query: queryStr,
+		Args:  args,
+	}
+}
+
+func sanitizePrimaryKeyInfo(primaryKeyInfo []models.PrimaryKeyInfo, driver Driver) []models.PrimaryKeyInfo {
+	sanitizedPrimaryKeyInfo := []models.PrimaryKeyInfo{}
+
+	for _, pki := range primaryKeyInfo {
+		sanitizedPrimaryKeyInfo = append(sanitizedPrimaryKeyInfo, models.PrimaryKeyInfo{
+			Name:  driver.FormatReference(pki.Name),
+			Value: pki.Value,
+		})
+	}
+
+	return sanitizedPrimaryKeyInfo
+}
+
+func getColNamesAndArgsAsString(values []models.CellValue) ([]string, []any) {
+	cols := []string{}
+	v := []any{}
+
+	for _, cell := range values {
+
+		cols = append(cols, cell.Column)
+
+		switch cell.Type {
+		case models.Empty:
+			v = append(v, "")
+		case models.Null:
+			v = append(v, "NULL")
+		case models.Default:
+			v = append(v, "DEFAULT")
+		default:
+			v = append(v, cell.Value)
+		}
+	}
+
+	return cols, v
+}
+
+func buildPlaceholders(values []models.CellValue, driver Driver) []string {
+	placeholders := []string{}
+
+	index := 1
+
+	for _, cell := range values {
+		switch cell.Type {
+		// case models.Empty:
+		// placeholders = append(placeholders, "")
+		// case models.Null:
+		// 	placeholders = append(placeholders, "NULL")
+		case models.Default:
+			placeholders = append(placeholders, "DEFAULT")
+			index--
+		default:
+			placeholders = append(placeholders, driver.FormatPlaceholder(index))
+			index++
+		}
+	}
+	return placeholders
+}
+
+// ReferencingTablesHeader is the shape every driver returns from
+// GetReferencingTables, so the UI does not need per-provider normalization.
+var ReferencingTablesHeader = []string{
+	"constraint_name",
+	"table_schema",
+	"table_name",
+	"column_name",
+	"referenced_column_name",
+}
+
+// scanReferencingTables reads rows shaped like ReferencingTablesHeader and
+// prepends that header, mirroring the [][]string convention of the other
+// table information getters.
+func scanReferencingTables(rows *sql.Rows) ([][]string, error) {
+	results := [][]string{append([]string(nil), ReferencingTablesHeader...)}
+
+	for rows.Next() {
+		var constraintName, tableSchema, tableName, columnName, referencedColumn sql.NullString
+
+		if err := rows.Scan(&constraintName, &tableSchema, &tableName, &columnName, &referencedColumn); err != nil {
+			return nil, err
+		}
+
+		results = append(results, []string{
+			constraintName.String,
+			tableSchema.String,
+			tableName.String,
+			columnName.String,
+			referencedColumn.String,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return results, nil
+}

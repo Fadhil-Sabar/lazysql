@@ -1,0 +1,184 @@
+package helpers
+
+import (
+	"bufio"
+	"encoding/csv"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// CSVWriter supports streaming CSV writing with atomic file creation.
+// It writes to a temporary file and renames it to the final path on Commit().
+type CSVWriter struct {
+	file           *os.File
+	bufferedWriter *bufio.Writer
+	csvWriter      *csv.Writer
+	columnCount    int
+	initialized    bool
+	rowCount       int
+	cleanedRecord  []string // reusable slice to reduce allocations
+	tempPath       string
+	finalPath      string
+	done           bool
+}
+
+var errCSVWriterClosed = errors.New("CSV writer is closed")
+
+// NewCSVWriter creates a new CSVWriter that writes to a temporary file.
+// Call Commit() to finalize the file, or Abort() to discard it.
+func NewCSVWriter(filePath string) (*CSVWriter, error) {
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+
+	tempFile, err := os.CreateTemp(dir, ".lazysql_export_*.tmp")
+	if err != nil {
+		return nil, err
+	}
+
+	bufferedWriter := bufio.NewWriterSize(tempFile, 64*1024)
+	csvWriter := csv.NewWriter(bufferedWriter)
+
+	return &CSVWriter{
+		file:           tempFile,
+		bufferedWriter: bufferedWriter,
+		csvWriter:      csvWriter,
+		tempPath:       tempFile.Name(),
+		finalPath:      filePath,
+	}, nil
+}
+
+// WriteRecords writes records to CSV.
+// If includeHeader is true, records[0] is written as the header.
+// If includeHeader is false, records[0] (header) is skipped and only records[1:] are written.
+func (w *CSVWriter) WriteRecords(records [][]string, includeHeader bool) error {
+	if len(records) == 0 {
+		return nil
+	}
+	return w.writeBatch(records[0], records[1:], includeHeader, true)
+}
+
+// WriteBatch writes one streamed batch to CSV. columns is the header returned
+// by the database and rows contains data rows only. Keeping this API separate
+// from WriteRecords lets query exports write each driver batch directly without
+// assembling a complete result in memory.
+func (w *CSVWriter) WriteBatch(columns []string, rows [][]string, includeHeader bool) error {
+	return w.writeBatch(columns, rows, includeHeader, false)
+}
+
+func (w *CSVWriter) writeBatch(columns []string, rows [][]string, includeHeader, cleanMarkers bool) error {
+	if w.done {
+		return errCSVWriterClosed
+	}
+	if len(columns) == 0 && len(rows) == 0 {
+		return nil
+	}
+	if !w.initialized {
+		if len(columns) == 0 {
+			if len(rows) == 0 {
+				return nil
+			}
+			columns = rows[0]
+			if includeHeader {
+				rows = rows[1:]
+			}
+		}
+		w.columnCount = len(columns)
+		w.cleanedRecord = make([]string, w.columnCount)
+		w.initialized = true
+	}
+
+	writeRow := func(record []string, clean bool) error {
+		for i := range w.cleanedRecord {
+			if i < len(record) {
+				w.cleanedRecord[i] = record[i]
+				if clean {
+					w.cleanedRecord[i] = CleanCellValue(record[i])
+				}
+			} else {
+				w.cleanedRecord[i] = ""
+			}
+		}
+		return w.csvWriter.Write(w.cleanedRecord)
+	}
+
+	if includeHeader && len(columns) > 0 {
+		if err := writeRow(columns, false); err != nil {
+			return err
+		}
+	}
+	for _, record := range rows {
+		if err := writeRow(record, cleanMarkers); err != nil {
+			return err
+		}
+		w.rowCount++
+	}
+
+	return nil
+}
+
+// Commit flushes, closes the temp file, and renames it to the final path.
+// After Commit, the CSVWriter should not be used.
+func (w *CSVWriter) Commit() error {
+	if w.done {
+		return nil
+	}
+
+	w.csvWriter.Flush()
+	if err := w.csvWriter.Error(); err != nil {
+		w.Abort()
+		return err
+	}
+	if err := w.bufferedWriter.Flush(); err != nil {
+		w.Abort()
+		return err
+	}
+
+	if err := w.file.Close(); err != nil {
+		w.done = true
+		_ = os.Remove(w.tempPath)
+		return err
+	}
+	w.done = true
+
+	if err := os.Rename(w.tempPath, w.finalPath); err != nil {
+		// The final path is never touched unless rename succeeds. Remove the
+		// closed temporary file on failure so an aborted export cannot leak a
+		// partial artifact beside the requested destination.
+		_ = os.Remove(w.tempPath)
+		return err
+	}
+
+	return nil
+}
+
+// Abort closes the temp file and removes it.
+// Safe to call multiple times or after Commit.
+func (w *CSVWriter) Abort() {
+	if w.done {
+		return
+	}
+	w.done = true
+
+	_ = w.file.Close()
+	_ = os.Remove(w.tempPath)
+}
+
+// RowCount returns the number of data rows written (excluding header)
+func (w *CSVWriter) RowCount() int {
+	return w.rowCount
+}
+
+// CleanCellValue removes special markers from cell values (NULL&, EMPTY&, DEFAULT&)
+func CleanCellValue(value string) string {
+	if cleaned, found := strings.CutSuffix(value, "&"); found {
+		switch cleaned {
+		case "NULL", "EMPTY", "DEFAULT":
+			return ""
+		}
+	}
+	return value
+}

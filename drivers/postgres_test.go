@@ -1,0 +1,866 @@
+package drivers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	_ "github.com/lib/pq"
+	"github.com/xo/dburl"
+
+	"github.com/jorgerojas26/lazysql/models"
+)
+
+const (
+	DBNamePostgres    = "postgres"
+	schemaPostgres    = "public"
+	tableNamePostgres = "test_table"
+)
+
+var schemaAndTablePostgres = fmt.Sprintf("%s.%s", schemaPostgres, tableNamePostgres)
+
+func TestPostgres_FormatArg_SpecialCharacters(t *testing.T) {
+	db := &Postgres{}
+
+	testCases := []struct {
+		name     string
+		arg      any
+		expected string
+	}{
+		{
+			name:     "String with single quote",
+			arg:      "O'Reilly",
+			expected: "'O''Reilly'",
+		},
+		{
+			name:     "String with backslash",
+			arg:      "C:\\Program Files",
+			expected: "'C:\\Program Files'",
+		},
+		{
+			name:     "String with double quotes",
+			arg:      `"quoted"`,
+			expected: `'"quoted"'`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			formattedArg := db.FormatArgForQueryString(tc.arg)
+			if formattedArg != tc.expected {
+				t.Fatalf("expected %q, but got %q", tc.expected, formattedArg)
+			}
+		})
+	}
+}
+
+func TestPostgres_FormatArg(t *testing.T) {
+	db := &Postgres{}
+
+	testCases := []struct {
+		name     string
+		arg      any
+		expected string
+	}{
+		{
+			name:     "Integer argument",
+			arg:      123,
+			expected: "123",
+		},
+		{
+			name:     "String argument",
+			arg:      "test string",
+			expected: "'test string'",
+		},
+		{
+			name:     "Byte array argument",
+			arg:      []byte("byte array"),
+			expected: "[98 121 116 101 32 97 114 114 97 121]",
+		},
+		{
+			name:     "Float argument",
+			arg:      123.45,
+			expected: "123.45",
+		},
+		{
+			name:     "Boolean true",
+			arg:      true,
+			expected: "true",
+		},
+		{
+			name:     "Boolean false",
+			arg:      false,
+			expected: "false",
+		},
+		{
+			name:     "NULL value",
+			arg:      nil,
+			expected: "<nil>",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			formattedArg := db.FormatArgForQueryString(tc.arg)
+			if formattedArg != tc.expected {
+				t.Fatalf("expected %q, but got %q", tc.expected, formattedArg)
+			}
+		})
+	}
+}
+
+func TestPostgres_DMLChangeToQueryString(t *testing.T) {
+	db := &Postgres{}
+
+	testCases := []struct {
+		name     string
+		change   models.DBDMLChange
+		expected string
+	}{
+		{
+			name: "Insert with int value",
+			change: models.DBDMLChange{
+				Table: schemaAndTablePostgres,
+				Type:  models.DMLInsertType,
+				Values: []models.CellValue{
+					{Column: "name", Value: "test_name", Type: models.String},
+					{Column: "value", Value: 123, Type: models.String},
+				},
+			},
+			// expected: `INSERT INTO "test_db"."test_table" (name, value) VALUES ('test_name', 123)`,
+			expected: fmt.Sprintf(`INSERT INTO "%s"."%s" (name, value) VALUES ('test_name', 123)`, schemaPostgres, tableNamePostgres),
+		},
+		{
+			name: "Update with string value",
+			change: models.DBDMLChange{
+				Table: schemaAndTablePostgres,
+				Type:  models.DMLUpdateType,
+				Values: []models.CellValue{
+					{Column: "name", Value: "test_name", Type: models.String},
+					{Column: "value", Value: "123", Type: models.String},
+				},
+				PrimaryKeyInfo: []models.PrimaryKeyInfo{
+					{Name: "id", Value: "1"},
+				},
+			},
+			expected: fmt.Sprintf(`UPDATE "%s"."%s" SET "name" = 'test_name', "value" = '123' WHERE "id" = '1'`, schemaPostgres, tableNamePostgres),
+		},
+		{
+			name: "Delete with UUID value",
+			change: models.DBDMLChange{
+				Table: schemaAndTablePostgres,
+				Type:  models.DMLDeleteType,
+				PrimaryKeyInfo: []models.PrimaryKeyInfo{
+					{Name: "id", Value: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"},
+				},
+			},
+			expected: fmt.Sprintf(`DELETE FROM "%s"."%s" WHERE "id" = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'`, schemaPostgres, tableNamePostgres),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			queryString, err := db.DMLChangeToQueryString(tc.change)
+			if err != nil {
+				t.Fatalf("DMLChangeToQueryString failed: %v", err)
+			}
+			if queryString != tc.expected {
+				t.Fatalf("Expected:\n%q\nGot:\n%q", tc.expected, queryString)
+			}
+		})
+	}
+}
+
+func TestPostgres_Connect_Mock(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error creating mock: %v", err)
+	}
+	defer db.Close()
+
+	pg := &Postgres{Connection: db}
+	mock.ExpectPing()
+
+	err = pg.Connection.Ping()
+	if err != nil {
+		t.Fatalf("Ping failed: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
+
+func TestPostgres_ErrorScenarios(t *testing.T) {
+	testCases := []struct {
+		name      string
+		setupMock func(mock sqlmock.Sqlmock)
+		testFunc  func(db *Postgres) error
+	}{
+		{
+			name: "GetTables error",
+			setupMock: func(mock sqlmock.Sqlmock) {
+				mock.ExpectQuery("SELECT table_name, table_schema FROM information_schema.tables WHERE table_catalog = \\$1").WithArgs(schemaPostgres).
+					WillReturnError(errors.New("query error"))
+			},
+			testFunc: func(db *Postgres) error {
+				_, err := db.GetTables(context.Background(), schemaPostgres)
+				return err
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("Error creating mock: %v", err)
+			}
+			defer db.Close()
+
+			tc.setupMock(mock)
+			pg := &Postgres{Connection: db, CurrentDatabase: schemaPostgres}
+
+			err = tc.testFunc(pg)
+			if err == nil {
+				t.Error("Expected error but got nil")
+			}
+
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("Unfulfilled expectations: %s", err)
+			}
+		})
+	}
+}
+
+func TestPostgres_GetTableColumns(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("Error creating mock: %v", err)
+	}
+	defer db.Close()
+
+	pg := &Postgres{Connection: db, CurrentDatabase: DBNamePostgres}
+
+	// Mocks expected query with all 5 columns including the new "comment" field
+	rows := sqlmock.NewRows([]string{
+		"column_name",
+		"data_type",
+		"is_nullable",
+		"column_default",
+		"comment",
+	}).AddRow(
+		"id",
+		"integer",
+		"NO",
+		"nextval('test_table_id_seq'::regclass)",
+		"Primary key identifier",
+	).AddRow(
+		"name",
+		"character varying",
+		"YES",
+		"",
+		"User name field",
+	).AddRow(
+		"email",
+		"character varying",
+		"YES",
+		"",
+		"", // Empty comment
+	)
+
+	mock.ExpectQuery("SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, COALESCE(pd.description, '') as comment FROM information_schema.columns c LEFT JOIN pg_class pc ON pc.relname = c.table_name AND pc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = c.table_schema) LEFT JOIN pg_namespace pn ON pn.nspname = c.table_schema AND pn.oid = pc.relnamespace LEFT JOIN pg_description pd ON pd.objoid = pc.oid AND pd.objsubid = c.ordinal_position WHERE c.table_catalog = $1 AND c.table_schema = $2 AND c.table_name = $3 ORDER by c.ordinal_position").
+		WithArgs(DBNamePostgres, schemaPostgres, tableNamePostgres).
+		WillReturnRows(rows)
+
+	columns, err := pg.GetTableColumns(context.Background(), DBNamePostgres, schemaAndTablePostgres)
+	if err != nil {
+		t.Fatalf("GetTableColumns failed: %v", err)
+	}
+
+	expected := [][]string{
+		{"column_name", "data_type", "is_nullable", "column_default", "comment"},
+		{"id", "integer", "NO", "nextval('test_table_id_seq'::regclass)", "Primary key identifier"},
+		{"name", "character varying", "YES", "", "User name field"},
+		{"email", "character varying", "YES", "", ""},
+	}
+
+	if !reflect.DeepEqual(columns, expected) {
+		t.Fatalf("Expected %v, got %v", expected, columns)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
+
+func TestPostgres_GetTableColumns_Error(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error creating mock: %v", err)
+	}
+	defer db.Close()
+
+	pg := &Postgres{Connection: db, CurrentDatabase: DBNamePostgres}
+	mock.ExpectQuery("SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, COALESCE\\(pd.description, ''\\) as comment FROM information_schema.columns c LEFT JOIN pg_class pc ON pc.relname = c.table_name AND pc.relnamespace = \\(SELECT oid FROM pg_namespace WHERE nspname = c.table_schema\\) LEFT JOIN pg_namespace pn ON pn.nspname = c.table_schema AND pn.oid = pc.relnamespace LEFT JOIN pg_description pd ON pd.objoid = pc.oid AND pd.objsubid = c.ordinal_position WHERE c.table_catalog = \\$1 AND c.table_schema = \\$2 AND c.table_name = \\$3 ORDER by c.ordinal_position").WithArgs(DBNamePostgres, schemaPostgres, tableNamePostgres).
+		WillReturnError(errors.New("query error"))
+
+	_, err = pg.GetTableColumns(context.Background(), DBNamePostgres, schemaAndTablePostgres)
+	if err == nil {
+		t.Fatal("Expected error but got nil")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
+
+func TestPostgres_GetRecords(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error creating mock: %v", err)
+	}
+	defer db.Close()
+
+	pg := &Postgres{Connection: db, CurrentDatabase: DBNamePostgres}
+
+	columns := []string{"id", "name"}
+	rows := sqlmock.NewRows(columns).
+		AddRow(1, "Alice").
+		AddRow(2, "Bob")
+
+	mock.ExpectQuery(fmt.Sprintf(`SELECT \* FROM "%s"."%s" LIMIT \$1 OFFSET \$2`, schemaPostgres, tableNamePostgres)).WithArgs(DefaultRowLimit+1, 0).WillReturnRows(rows)
+
+	page, err := pg.GetRecords(context.Background(), DBNamePostgres, schemaAndTablePostgres, "", "", 0, DefaultRowLimit)
+	if err != nil {
+		t.Fatalf("GetRecords failed: %v", err)
+	}
+	records := page.Rows
+
+	expected := [][]string{
+		{"id", "name"},
+		{"1", "Alice"},
+		{"2", "Bob"},
+	}
+
+	if !reflect.DeepEqual(records, expected) {
+		t.Fatalf("Expected %v, got %v", expected, records)
+	}
+
+	if page.HasNextPage {
+		t.Fatal("expected no next page")
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
+
+func TestPostgres_ExecuteQuery_SameDatabase(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error creating mock: %v", err)
+	}
+	defer db.Close()
+
+	// connectionFor short-circuits to the existing connection when the
+	// requested database matches CurrentDatabase, so no new physical
+	// connection (untestable via sqlmock) is opened.
+	pg := &Postgres{Connection: db, CurrentDatabase: DBNamePostgres}
+
+	rows := sqlmock.NewRows([]string{"id", "name"}).AddRow(1, "Alice")
+
+	mock.ExpectQuery(`SELECT \* FROM users`).WillReturnRows(rows)
+
+	results, total, err := pg.ExecuteQuery(context.Background(), DBNamePostgres, "SELECT * FROM users")
+	if err != nil {
+		t.Fatalf("ExecuteQuery failed: %v", err)
+	}
+
+	if total != 1 {
+		t.Fatalf("Expected total 1, got %d", total)
+	}
+
+	expected := [][]string{
+		{"id", "name"},
+		{"1", "Alice"},
+	}
+
+	if !reflect.DeepEqual(results, expected) {
+		t.Fatalf("Expected %v, got %v", expected, results)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
+
+func TestPostgres_ExecuteQuery_EmptyDatabaseFallsBackToCurrent(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error creating mock: %v", err)
+	}
+	defer db.Close()
+
+	pg := &Postgres{Connection: db, CurrentDatabase: DBNamePostgres}
+
+	rows := sqlmock.NewRows([]string{"id"}).AddRow(1)
+
+	mock.ExpectQuery(`SELECT \* FROM users`).WillReturnRows(rows)
+
+	// Empty database string must not attempt to open a new connection to "".
+	_, _, err = pg.ExecuteQuery(context.Background(), "", "SELECT * FROM users")
+	if err != nil {
+		t.Fatalf("ExecuteQuery failed: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
+
+func TestPostgres_GetForeignKeys(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("Error creating mock: %v", err)
+	}
+	defer db.Close()
+
+	pg := &Postgres{Connection: db, CurrentDatabase: DBNamePostgres}
+
+	rows := sqlmock.NewRows([]string{
+		"constraint_name", "column_name",
+		"foreign_table_schema", "foreign_table_name", "foreign_column_name",
+		"update_rule", "delete_rule",
+	}).AddRow(
+		"fk_test", "user_id",
+		"public", "users", "id",
+		"CASCADE", "SET NULL",
+	)
+
+	mock.ExpectQuery(fmt.Sprintf(`
+        SELECT
+            con.conname AS constraint_name,
+            src_att.attname AS column_name,
+            ref_ns.nspname AS foreign_table_schema,
+            ref_cls.relname AS foreign_table_name,
+            ref_att.attname AS foreign_column_name
+        FROM pg_constraint con
+        JOIN pg_class src_cls ON src_cls.oid = con.conrelid
+        JOIN pg_namespace src_ns ON src_ns.oid = src_cls.relnamespace
+        JOIN pg_class ref_cls ON ref_cls.oid = con.confrelid
+        JOIN pg_namespace ref_ns ON ref_ns.oid = ref_cls.relnamespace
+        JOIN LATERAL unnest(con.conkey, con.confkey) AS fk(src_attnum, ref_attnum) ON true
+        JOIN pg_attribute src_att ON src_att.attrelid = con.conrelid AND src_att.attnum = fk.src_attnum
+        JOIN pg_attribute ref_att ON ref_att.attrelid = con.confrelid AND ref_att.attnum = fk.ref_attnum
+        WHERE con.contype = 'f'
+          AND src_ns.nspname = '%s'
+          AND src_cls.relname = '%s'
+        ORDER BY con.conname, src_att.attnum
+  `, schemaPostgres, tableNamePostgres)).WillReturnRows(rows)
+
+	constraints, err := pg.GetForeignKeys(context.Background(), DBNamePostgres, schemaAndTablePostgres)
+	if err != nil {
+		t.Fatalf("GetForeignKeys failed: %v", err)
+	}
+
+	expected := [][]string{
+		{"constraint_name", "column_name", "foreign_table_schema", "foreign_table_name", "foreign_column_name", "update_rule", "delete_rule"},
+		{"fk_test", "user_id", "public", "users", "id", "CASCADE", "SET NULL"},
+	}
+
+	if !reflect.DeepEqual(constraints, expected) {
+		t.Fatalf("Expected %v, got %v", expected, constraints)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
+
+func TestPostgres_GetIndexes(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error creating mock: %v", err)
+	}
+	defer db.Close()
+
+	pg := &Postgres{Connection: db, CurrentDatabase: DBNamePostgres}
+
+	rows := sqlmock.NewRows([]string{"indexname", "indexdef"}).
+		AddRow("idx_name", "CREATE INDEX idx_name ON test_table USING btree (name)")
+
+	mock.ExpectQuery(fmt.Sprintf(`
+        SELECT
+            i.relname AS index_name,
+            a.attname AS column_name,
+            am.amname AS type
+        FROM
+            pg_namespace n,
+            pg_class t,
+            pg_class i,
+            pg_index ix,
+            pg_attribute a,
+            pg_am am
+        WHERE
+            t.oid = ix.indrelid
+            and i.oid = ix.indexrelid
+            and a.attrelid = t.oid
+            and a.attnum = ANY\(ix.indkey\)
+            and t.relkind = 'r'
+            and am.oid = i.relam
+          	and n.oid = t.relnamespace
+            and n.nspname = '%s'
+            and t.relname = '%s'
+        ORDER BY
+            t.relname,
+            i.relname
+  `, schemaPostgres, tableNamePostgres)).WillReturnRows(rows)
+
+	indexes, err := pg.GetIndexes(context.Background(), DBNamePostgres, schemaAndTablePostgres)
+	if err != nil {
+		t.Fatalf("GetIndexes failed: %v", err)
+	}
+
+	expected := [][]string{
+		{"indexname", "indexdef"},
+		{"idx_name", "CREATE INDEX idx_name ON test_table USING btree (name)"},
+	}
+
+	if !reflect.DeepEqual(indexes, expected) {
+		t.Fatalf("Expected %v, got %v", expected, indexes)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
+
+func TestPostgres_Transactions(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error creating mock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectRollback()
+	mock.ExpectBegin()
+	mock.ExpectCommit()
+
+	// Test Begin and Rollback
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Test Begin and Commit
+	tx, err = db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
+
+func TestPostgres_ExecutePendingChanges(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error creating mock: %v", err)
+	}
+	defer db.Close()
+
+	pg := &Postgres{Connection: db, CurrentDatabase: DBNamePostgres}
+
+	changes := []models.DBDMLChange{
+		{
+			Table: schemaAndTablePostgres,
+			Type:  models.DMLUpdateType,
+			Values: []models.CellValue{
+				{Column: "name", Value: "New Name", Type: models.String},
+			},
+			PrimaryKeyInfo: []models.PrimaryKeyInfo{
+				{Name: "id", Value: 1},
+			},
+		},
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectExec(fmt.Sprintf(`UPDATE "%s"."%s" SET "name" = \$1 WHERE "id" = \$2`, schemaPostgres, tableNamePostgres)).WithArgs("New Name", 1).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	err = pg.ExecutePendingChanges(context.Background(), changes)
+	if err != nil {
+		t.Fatalf("ExecutePendingChanges failed: %v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
+
+func TestPostgres_GetPrimaryKeyColumnNames(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error creating mock: %v", err)
+	}
+	defer db.Close()
+
+	pg := &Postgres{Connection: db, CurrentDatabase: DBNamePostgres}
+
+	rows := sqlmock.NewRows([]string{"column_name"}).
+		AddRow("id")
+
+	mock.ExpectQuery(`
+		SELECT
+			a.attname AS column_name
+		FROM
+			pg_index i
+			JOIN pg_class c ON c.oid = i.indrelid
+			JOIN pg_attribute a ON a.attrelid = c.oid
+				AND a.attnum = ANY \(i.indkey\)
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE
+			relname = \$2 AND nspname = \$1 AND indisprimary
+	`).WithArgs(schemaPostgres, tableNamePostgres).WillReturnRows(rows)
+
+	keys, err := pg.GetPrimaryKeyColumnNames(context.Background(), DBNamePostgres, schemaAndTablePostgres)
+	if err != nil {
+		t.Fatalf("GetPrimaryKeyColumnNames failed: %v", err)
+	}
+
+	expected := []string{"id"}
+	if !reflect.DeepEqual(keys, expected) {
+		t.Fatalf("Expected %v, got %v", expected, keys)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
+
+func TestPostgres_SetGetProvider(t *testing.T) {
+	db := &Postgres{}
+	db.SetProvider(DriverPostgres)
+
+	if db.GetProvider() != DriverPostgres {
+		t.Fatalf("Provider mismatch: got %s, expected %s", db.GetProvider(), DriverPostgres)
+	}
+}
+
+func TestPostgres_formatTableName(t *testing.T) {
+	db := &Postgres{}
+
+	splitTableString := strings.Split(schemaAndTablePostgres, ".")
+
+	tableSchema := splitTableString[0]
+	name := splitTableString[1]
+
+	tableName, err := db.formatTableName(schemaAndTablePostgres)
+	if err != nil {
+		t.Fatalf("formatTableName failed: %v", err)
+	}
+
+	expected := fmt.Sprintf("\"%s\".\"%s\"", tableSchema, name)
+
+	if tableName != expected {
+		t.Fatalf("formatTableName failed: got %s, expected %s", tableName, expected)
+	}
+}
+
+func TestDSNValue(t *testing.T) {
+	tests := []struct {
+		name     string
+		dsn      string
+		key      string
+		expected string
+	}{
+		{"extracts host", "host=/var/run/postgresql port= dbname=", "host", "/var/run/postgresql"},
+		{"extracts dbname", "host=/tmp dbname=postgres", "dbname", "postgres"},
+		{"empty value", "host= port=", "host", ""},
+		{"missing key", "host=/tmp dbname=postgres", "user", ""},
+		{"empty dsn", "", "host", ""},
+		{"key is prefix of another key", "hostaddr=1.2.3.4 host=/tmp", "host", "/tmp"},
+		{"no space separators but key=value", "host=/tmp", "host", "/tmp"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := dsnValue(tt.dsn, tt.key)
+			if got != tt.expected {
+				t.Errorf("dsnValue(%q, %q) = %q, want %q", tt.dsn, tt.key, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestBuildReconnectURL(t *testing.T) {
+	tests := []struct {
+		name          string
+		urlstr        string
+		newDB         string
+		wantTransport string
+		wantHost      string
+	}{
+		{
+			name:          "unix socket — no dbname in path",
+			urlstr:        "postgresql:///tmp",
+			newDB:         "mydb",
+			wantTransport: "unix",
+			wantHost:      "",
+		},
+		{
+			name:          "unix socket — dbname in path, replaced",
+			urlstr:        "postgresql:///tmp/postgres",
+			newDB:         "mydb",
+			wantTransport: "unix",
+			wantHost:      "",
+		},
+		{
+			name:          "unix socket with custom port — port preserved",
+			urlstr:        "postgresql:///tmp:6666/postgres",
+			newDB:         "mydb",
+			wantTransport: "unix",
+			wantHost:      "",
+		},
+		{
+			name:          "tcp — database replaced in path, host preserved",
+			urlstr:        "postgresql://localhost/postgres",
+			newDB:         "mydb",
+			wantTransport: "tcp",
+			wantHost:      "localhost",
+		},
+		{
+			name:          "tcp with user and sslmode — user + query preserved",
+			urlstr:        "postgresql://user@localhost/postgres?sslmode=disable",
+			newDB:         "other",
+			wantTransport: "tcp",
+			wantHost:      "localhost",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original, err := dburl.Parse(tt.urlstr)
+			if err != nil {
+				t.Fatalf("dburl.Parse(%q): %v", tt.urlstr, err)
+			}
+			originalHost := dsnValue(original.DSN, "host")
+			originalPort := dsnValue(original.DSN, "port")
+
+			got, err := buildReconnectURL(tt.urlstr, tt.newDB)
+			if err != nil {
+				t.Fatalf("buildReconnectURL(%q, %q): %v", tt.urlstr, tt.newDB, err)
+			}
+
+			reparsed, err := dburl.Parse(got)
+			if err != nil {
+				t.Fatalf("re-parse of %q failed: %v", got, err)
+			}
+			newHost := dsnValue(reparsed.DSN, "host")
+			newPort := dsnValue(reparsed.DSN, "port")
+			newDBName := dsnValue(reparsed.DSN, "dbname")
+
+			if reparsed.Transport != tt.wantTransport {
+				t.Errorf("Transport = %q, want %q", reparsed.Transport, tt.wantTransport)
+			}
+			if reparsed.Hostname() != tt.wantHost {
+				t.Errorf("Hostname = %q, want %q", reparsed.Hostname(), tt.wantHost)
+			}
+			if newHost != originalHost {
+				t.Errorf("host must be preserved: original=%q rebuilt=%q", originalHost, newHost)
+			}
+			if newPort != originalPort {
+				t.Errorf("port must be preserved: original=%q rebuilt=%q", originalPort, newPort)
+			}
+			if newDBName != tt.newDB {
+				t.Errorf("dbname = %q, want %q (rebuilt URL: %s)", newDBName, tt.newDB, got)
+			}
+			if tt.urlstr == "postgresql://user@localhost/postgres?sslmode=disable" {
+				if u := reparsed.User; u != nil {
+					if u.Username() != "user" {
+						t.Errorf("Username = %q, want %q", u.Username(), "user")
+					}
+				}
+				if reparsed.Query().Get("sslmode") != "disable" {
+					t.Errorf("sslmode = %q, want %q", reparsed.Query().Get("sslmode"), "disable")
+				}
+			}
+		})
+	}
+}
+
+func TestPostgres_GetReferencingTables(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error creating mock: %v", err)
+	}
+	defer db.Close()
+
+	rows := sqlmock.NewRows(ReferencingTablesHeader).
+		AddRow("LookupList_organizationId_fkey", schemaPostgres, "LookupList", "organizationId", "id").
+		AddRow("Role_organizationId_fkey", schemaPostgres, "Role", "organizationId", "id")
+
+	mock.ExpectQuery("SELECT(.|\n)+FROM pg_constraint con(.|\n)+ref_ns.nspname = \\$1(.|\n)+ref_cls.relname = \\$2").
+		WithArgs(schemaPostgres, tableNamePostgres).
+		WillReturnRows(rows)
+
+	pg := &Postgres{Connection: db, CurrentDatabase: DBNamePostgres}
+
+	results, err := pg.GetReferencingTables(context.Background(), DBNamePostgres, schemaAndTablePostgres)
+	if err != nil {
+		t.Fatalf("GetReferencingTables failed: %v", err)
+	}
+
+	expected := [][]string{
+		ReferencingTablesHeader,
+		{"LookupList_organizationId_fkey", schemaPostgres, "LookupList", "organizationId", "id"},
+		{"Role_organizationId_fkey", schemaPostgres, "Role", "organizationId", "id"},
+	}
+
+	if !reflect.DeepEqual(results, expected) {
+		t.Errorf("GetReferencingTables returned %v, expected %v", results, expected)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
+
+func TestPostgres_GetReferencingTables_RequiresQualifiedTable(t *testing.T) {
+	pg := &Postgres{}
+
+	if _, err := pg.GetReferencingTables(context.Background(), DBNamePostgres, tableNamePostgres); err == nil {
+		t.Error("expected an error for a table name without a schema")
+	}
+
+	if _, err := pg.GetReferencingTables(context.Background(), "", schemaAndTablePostgres); err == nil {
+		t.Error("expected an error for an empty database name")
+	}
+
+	if _, err := pg.GetReferencingTables(context.Background(), DBNamePostgres, ""); err == nil {
+		t.Error("expected an error for an empty table name")
+	}
+}
+
+func TestPostgresPendingChangesRejectsMixedDatabases(t *testing.T) {
+	pg := &Postgres{CurrentDatabase: "source"}
+	err := pg.ExecutePendingChanges(context.Background(), []models.DBDMLChange{
+		{Database: "source", Table: "public.users", Type: models.DMLDeleteType},
+		{Database: "target", Table: "public.users", Type: models.DMLDeleteType},
+	})
+	if err == nil || !strings.Contains(err.Error(), "across databases") {
+		t.Fatalf("mixed-database changes were not rejected before dispatch: %v", err)
+	}
+}

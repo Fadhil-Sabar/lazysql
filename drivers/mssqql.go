@@ -1,0 +1,1217 @@
+package drivers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+	// MSSQL driver
+	_ "github.com/microsoft/go-mssqldb"
+	// Azure AD auth support for Azure SQL (e.g. fedauth=ActiveDirectoryDefault)
+	_ "github.com/microsoft/go-mssqldb/azuread"
+	// Kerberos auth support on non-Windows (e.g. authenticator=krb5)
+	_ "github.com/microsoft/go-mssqldb/integratedauth/krb5"
+	"github.com/xo/dburl"
+
+	"github.com/jorgerojas26/lazysql/helpers/logger"
+	"github.com/jorgerojas26/lazysql/models"
+)
+
+type MSSQL struct {
+	Connection      *sql.DB
+	Provider        string
+	PoolConfig      models.ConnectionPoolConfig
+	CurrentDatabase string
+	isAzureSQL      bool
+}
+
+// mssqlGUIDToUUID converts a 16-byte little-endian GUID from MSSQL
+// into a standard uuid.UUID.
+func mssqlGUIDToUUID(dbBytes []byte) (uuid.UUID, error) {
+	if len(dbBytes) != 16 {
+		return uuid.Nil, fmt.Errorf("invalid GUID length: expected 16 bytes, got %d", len(dbBytes))
+	}
+
+	// Create a copy to avoid modifying the original slice
+	b := make([]byte, 16)
+	copy(b, dbBytes)
+
+	// The first 3 components of a GUID from MSSQL are little-endian.
+	// We need to swap the bytes to match the big-endian format
+	// expected by the standard UUID library.
+
+	// Swap bytes for the first 4-byte group (Data1)
+	b[0], b[1], b[2], b[3] = b[3], b[2], b[1], b[0]
+
+	// Swap bytes for the next 2-byte group (Data2)
+	b[4], b[5] = b[5], b[4]
+
+	// Swap bytes for the final 2-byte group of the first half (Data3)
+	b[6], b[7] = b[7], b[6]
+
+	// The last 8 bytes (Data4) are already in the correct big-endian order.
+
+	return uuid.FromBytes(b)
+}
+
+func (db *MSSQL) TestConnection(ctx context.Context, urlstr string) error {
+	return db.Connect(ctx, urlstr)
+}
+
+func (db *MSSQL) Connect(ctx context.Context, urlstr string) error {
+	ctx = contextOrBackground(ctx)
+	if urlstr == "" {
+		return errors.New("url string can not be empty")
+	}
+
+	db.SetProvider(DriverMSSQL)
+
+	var err error
+
+	db.Connection, err = dburl.Open(urlstr)
+	if err != nil {
+		return err
+	}
+
+	if err := applyConnectionPoolConfig(db.Connection, db.PoolConfig); err != nil {
+		_ = db.Connection.Close()
+		return err
+	}
+
+	if err := db.Connection.PingContext(ctx); err != nil {
+		_ = db.Connection.Close()
+		return err
+	}
+
+	if err := db.Connection.QueryRowContext(ctx, "SELECT DB_NAME()").Scan(&db.CurrentDatabase); err != nil {
+		_ = db.Connection.Close()
+		return err
+	}
+	var engineEdition int
+	if err := db.Connection.QueryRowContext(
+		ctx,
+		`SELECT CAST(SERVERPROPERTY('EngineEdition') AS INT)`,
+	).Scan(&engineEdition); err != nil {
+		_ = db.Connection.Close()
+		return err
+	}
+
+	// EngineEdition 5 is Azure SQL Database.
+	// Azure SQL Database does not support switching databases with USE.
+	db.isAzureSQL = engineEdition == 5
+
+	return nil
+}
+
+func quoteMSSQLIdentifier(identifier string) string {
+	return "[" + strings.ReplaceAll(identifier, "]", "]]") + "]"
+}
+
+func splitMSSQLTableName(table string) (schema, tableName string, err error) {
+	table = strings.TrimSpace(table)
+	schema, tableName, ok := strings.Cut(table, ".")
+	if !ok || strings.TrimSpace(schema) == "" || strings.TrimSpace(tableName) == "" || strings.Contains(tableName, ".") {
+		return "", "", fmt.Errorf("table must be in the format schema.table: %s", table)
+	}
+	return strings.TrimSpace(schema), strings.TrimSpace(tableName), nil
+}
+
+func splitMSSQLTableReference(table string) (schema, tableName string, qualified bool, err error) {
+	table = strings.TrimSpace(table)
+	if table == "" {
+		return "", "", false, errors.New("table name is required")
+	}
+	if strings.Contains(table, ".") {
+		schema, tableName, err := splitMSSQLTableName(table)
+		return schema, tableName, true, err
+	}
+	return "", table, false, nil
+}
+
+func (db *MSSQL) databasePrefix(database string) string {
+	if db.isAzureSQL {
+		return ""
+	}
+
+	return "USE " + quoteMSSQLIdentifier(database) + "; "
+}
+
+func (db *MSSQL) GetDatabases(ctx context.Context) ([]string, error) {
+	ctx = contextOrBackground(ctx)
+	if db.isAzureSQL {
+		var database string
+
+		if err := db.Connection.QueryRowContext(ctx, "SELECT DB_NAME()").Scan(&database); err != nil {
+			return nil, err
+		}
+
+		return []string{database}, nil
+	}
+
+	databases := make([]string, 0)
+
+	query := `
+		SELECT
+			name
+		FROM
+			sys.databases
+	`
+
+	rows, err := db.Connection.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var database string
+		if err := rows.Scan(&database); err != nil {
+			return nil, err
+		}
+
+		databases = append(databases, database)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return databases, nil
+}
+
+func (db *MSSQL) GetTables(ctx context.Context, database string) (map[string][]string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+
+	tables := make(map[string][]string)
+
+	query := "SELECT s.name AS schema_name, t.name AS table_name FROM " + quoteMSSQLIdentifier(database) + ".sys.tables AS t INNER JOIN " + quoteMSSQLIdentifier(database) + ".sys.schemas AS s ON t.schema_id = s.schema_id ORDER BY s.name, t.name"
+
+	rows, err := db.Connection.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var schema, table string
+		if err := rows.Scan(&schema, &table); err != nil {
+			return nil, err
+		}
+
+		tables[schema] = append(tables[schema], table)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return tables, nil
+}
+
+func (db *MSSQL) GetTableColumns(ctx context.Context, database, table string) ([][]string, error) {
+	ctx = contextOrBackground(ctx)
+	query := db.databasePrefix(database) + `
+        SELECT
+            c.name AS column_name,
+            t.name AS data_type,
+            c.is_nullable,
+            def.definition AS column_default,
+            ISNULL(ep.value, '') AS comment
+        FROM sys.columns c
+        INNER JOIN sys.types t ON c.system_type_id = t.system_type_id
+        LEFT JOIN sys.default_constraints def ON c.default_object_id = def.parent_column_id
+        LEFT JOIN sys.extended_properties ep ON ep.major_id = c.object_id
+            AND ep.minor_id = c.column_id
+            AND ep.name = 'MS_Description'
+        WHERE c.object_id = OBJECT_ID(@p2)
+        AND t.name <> 'sysname'
+        ORDER BY c.column_id;
+    `
+
+	return db.getTableInformation(ctx, query, database, table, "")
+}
+
+func (db *MSSQL) GetConstraints(ctx context.Context, database, table string) ([][]string, error) {
+	ctx = contextOrBackground(ctx)
+	schema, tableName, qualified, err := splitMSSQLTableReference(table)
+	if err != nil {
+		return nil, err
+	}
+	if !qualified {
+		schema, err = db.getCurrentSchema(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	query := db.databasePrefix(database) + `
+        SELECT
+            kc.name AS constraint_name,
+            c.name AS column_name,
+            kc.type_desc AS constraint_type
+        FROM sys.key_constraints kc
+        INNER JOIN sys.tables t
+            ON kc.parent_object_id = t.object_id
+        INNER JOIN sys.schemas s
+            ON t.schema_id = s.schema_id
+        INNER JOIN sys.index_columns ic
+            ON kc.unique_index_id = ic.index_id
+            AND kc.parent_object_id = ic.object_id
+        INNER JOIN sys.columns c
+            ON ic.column_id = c.column_id
+            AND ic.object_id = c.object_id
+        WHERE s.name = @p3
+          AND t.name = @p2
+          AND kc.type IN ('PK', 'UQ')
+    `
+
+	return db.getTableInformation(ctx, query, database, tableName, schema)
+}
+
+func (db *MSSQL) GetForeignKeys(ctx context.Context, database, table string) ([][]string, error) {
+	ctx = contextOrBackground(ctx)
+	schema, tableName, qualified, err := splitMSSQLTableReference(table)
+	if err != nil {
+		return nil, err
+	}
+
+	schemaFilter := ""
+	if qualified {
+		schemaFilter = "AND s.name = @p3"
+	}
+	query := db.databasePrefix(database) + fmt.Sprintf(`
+        SELECT
+            fk.name AS constraint_name,
+            c.name AS column_name,
+            DB_NAME(DB_ID(@p1)) AS current_database,
+            OBJECT_SCHEMA_NAME(fk.referenced_object_id, DB_ID(@p1)) + '.' +
+            OBJECT_NAME(fk.referenced_object_id, DB_ID(@p1)) AS referenced_table,
+            rc.name AS referenced_column,
+            fk.delete_referential_action_desc AS delete_rule,
+            fk.update_referential_action_desc AS update_rule
+        FROM sys.foreign_keys fk
+        INNER JOIN sys.foreign_key_columns fkc
+            ON fk.object_id = fkc.constraint_object_id
+        INNER JOIN sys.columns c
+            ON fkc.parent_column_id = c.column_id
+            AND fkc.parent_object_id = c.object_id
+        INNER JOIN sys.columns rc
+            ON fkc.referenced_column_id = rc.column_id
+            AND fkc.referenced_object_id = rc.object_id
+        INNER JOIN sys.tables t
+            ON fk.parent_object_id = t.object_id
+        INNER JOIN sys.schemas s
+            ON t.schema_id = s.schema_id
+        WHERE t.name = @p2
+          AND DB_NAME(DB_ID(@p1)) = @p1
+          %s
+    `, schemaFilter)
+
+	if qualified {
+		return db.getTableInformation(ctx, query, database, tableName, schema)
+	}
+	return db.getTableInformation(ctx, query, database, tableName, "")
+}
+
+func (db *MSSQL) GetIndexes(ctx context.Context, database, table string) ([][]string, error) {
+	ctx = contextOrBackground(ctx)
+	schema, tableName, qualified, err := splitMSSQLTableReference(table)
+	if err != nil {
+		return nil, err
+	}
+	if !qualified {
+		schema, err = db.getCurrentSchema(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	databaseJoin := `
+        INNER JOIN sys.databases d
+            ON d.name = @p1
+	`
+	databaseFilter := "AND DB_ID(@p1) = d.database_id"
+
+	if db.isAzureSQL {
+		// In Azure SQL Database, DB_ID() isn't guaranteed to match the
+		// database_id exposed by sys.databases. The connection is already
+		// scoped to the current database, so compare against DB_NAME().
+		databaseJoin = ""
+		databaseFilter = "AND DB_NAME() = @p1"
+	}
+
+	query := db.databasePrefix(database) + fmt.Sprintf(`
+        SELECT
+            t.name AS table_name,
+            i.name AS index_name,
+            CAST(i.is_unique AS BIT) AS is_unique,
+            CAST(i.is_primary_key AS BIT) AS is_primary_key,
+            i.type_desc AS index_type,
+            c.name AS column_name,
+            ic.key_ordinal AS seq_in_index,
+            CAST(ic.is_included_column AS BIT) AS is_included,
+            CAST(i.has_filter AS BIT) AS has_filter,
+            i.filter_definition
+        FROM sys.tables t
+        INNER JOIN sys.schemas s
+            ON t.schema_id = s.schema_id
+        %s
+        INNER JOIN sys.indexes i
+            ON t.object_id = i.object_id
+        INNER JOIN sys.index_columns ic
+            ON i.object_id = ic.object_id
+            AND i.index_id = ic.index_id
+        INNER JOIN sys.columns c
+            ON ic.column_id = c.column_id
+            AND t.object_id = c.object_id
+        WHERE t.name = @p2
+          AND s.name = @p3
+          %s
+        ORDER BY i.type_desc
+    `, databaseJoin, databaseFilter)
+
+	return db.getTableInformation(ctx, query, database, tableName, schema)
+}
+
+func (db *MSSQL) GetRecords(ctx context.Context, database, table, where, sort string, offset, limit int) (PageResult, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return PageResult{}, errors.New("database name is required")
+	}
+
+	if table == "" {
+		return PageResult{}, errors.New("table name is required")
+	}
+
+	pageSize, fetchLimit := pageSizeAndFetchLimit(limit)
+	baseQuery := db.databasePrefix(database) + "SELECT * FROM " + db.formatTableName(table)
+
+	if where != "" {
+		baseQuery += fmt.Sprintf(" %s", where)
+	}
+
+	if sort == "" {
+		sort = "(SELECT NULL)"
+	}
+
+	executableQuery := fmt.Sprintf(
+		"%s ORDER BY %s OFFSET @p1 ROWS FETCH NEXT @p2 ROWS ONLY",
+		baseQuery,
+		sort,
+	)
+
+	displayQueryString := fmt.Sprintf(
+		"%s ORDER BY %s OFFSET %s ROWS FETCH NEXT %s ROWS ONLY",
+		baseQuery,
+		sort,
+		db.FormatArg(offset, models.String),
+		db.FormatArg(fetchLimit, models.String),
+	)
+
+	rows, err := db.Connection.QueryContext(ctx, executableQuery, offset, fetchLimit)
+	if err != nil {
+		return PageResult{Query: displayQueryString}, err
+	}
+
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return PageResult{Query: displayQueryString}, err
+	}
+
+	results := [][]string{columns}
+
+	for rows.Next() {
+		rowValues := make([]any, len(columns))
+
+		for i := range columns {
+			rowValues[i] = new(sql.RawBytes)
+		}
+
+		if errScan := rows.Scan(rowValues...); errScan != nil {
+			return PageResult{Query: displayQueryString}, errScan
+		}
+
+		columnTypes, err := rows.ColumnTypes()
+		if err != nil {
+			return PageResult{Query: displayQueryString}, err
+		}
+
+		if len(columnTypes) != len(rowValues) {
+			return PageResult{Query: displayQueryString}, errors.New("unexpected number of column")
+		}
+
+		var row []string
+
+		for i, col := range rowValues {
+			if col == nil {
+				row = append(row, "NULL&")
+				continue
+			}
+
+			rawBytes, ok := col.(*sql.RawBytes)
+			if !ok {
+				return PageResult{Query: displayQueryString}, errors.New("unexpected type in column value")
+			}
+
+			columnType := columnTypes[i]
+			colType := columnType.DatabaseTypeName()
+
+			if colType == "UNIQUEIDENTIFIER" {
+				if guid, errParse := mssqlGUIDToUUID(*rawBytes); errParse == nil {
+					row = append(row, guid.String())
+				} else {
+					hexValue := hex.EncodeToString(*rawBytes)
+					row = append(row, "0x"+hexValue)
+
+					logger.Warn("Invalid GUID", map[string]any{
+						"table":  table,
+						"column": columns[i],
+						"value":  hexValue,
+						"error":  errParse,
+					})
+				}
+
+				continue
+			}
+
+			colval := string(*rawBytes)
+			nullable, _ := columnType.Nullable()
+
+			if nullable && colval == "" {
+				row = append(row, "NULL&")
+			} else {
+				row = append(row, colval)
+			}
+		}
+
+		results = append(results, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		return PageResult{Query: displayQueryString}, err
+	}
+
+	displayQueryString = fmt.Sprintf(
+		"%s ORDER BY %s OFFSET %d ROWS FETCH NEXT %d ROWS ONLY",
+		baseQuery,
+		sort,
+		offset,
+		fetchLimit,
+	)
+
+	return newPageResult(results, displayQueryString, pageSize), nil
+}
+
+func (db *MSSQL) GetEstimatedRowCount(ctx context.Context, database, table string) (*int64, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+	if table == "" {
+		return nil, errors.New("table name is required")
+	}
+
+	var estimate sql.NullInt64
+	query := db.databasePrefix(database) + `
+		SELECT SUM(row_count)
+		FROM sys.dm_db_partition_stats
+		WHERE object_id = OBJECT_ID(@p1) AND index_id IN (0, 1)
+	`
+	if err := db.Connection.QueryRowContext(ctx, query, table).Scan(&estimate); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !estimate.Valid || estimate.Int64 < 0 {
+		return nil, nil
+	}
+	return &estimate.Int64, nil
+}
+
+func (db *MSSQL) GetExactRowCount(ctx context.Context, database, table, where string) (int64, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return 0, errors.New("database name is required")
+	}
+	if table == "" {
+		return 0, errors.New("table name is required")
+	}
+
+	query := db.databasePrefix(database) + "SELECT COUNT(*) FROM " + db.formatTableName(table)
+	if where != "" {
+		query += " " + where
+	}
+
+	var count int64
+	if err := db.Connection.QueryRowContext(ctx, query).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (db *MSSQL) UpdateRecord(ctx context.Context, database, table, column, value, primaryKeyColumnName, primaryKeyValue string) error {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return errors.New("database name is required")
+	}
+
+	if table == "" {
+		return errors.New("table name is required")
+	}
+
+	if column == "" {
+		return errors.New("table column is required")
+	}
+
+	if primaryKeyColumnName == "" {
+		return errors.New("primary key column is required")
+	}
+
+	if primaryKeyValue == "" {
+		return errors.New("primary key value is required")
+	}
+
+	query := db.databasePrefix(database) +
+		"UPDATE " + db.formatTableName(table) +
+		" SET " + db.FormatReference(column) +
+		" = @p1 WHERE " + db.FormatReference(primaryKeyColumnName) +
+		" = @p2"
+
+	_, err := db.Connection.ExecContext(ctx, query, value, primaryKeyValue)
+
+	return err
+}
+
+func (db *MSSQL) DeleteRecord(ctx context.Context, database, table, primaryKeyColumnName, primaryKeyValue string) error {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return errors.New("database name is required")
+	}
+
+	if table == "" {
+		return errors.New("table name is required")
+	}
+
+	if primaryKeyColumnName == "" {
+		return errors.New("primary key column is required")
+	}
+
+	if primaryKeyValue == "" {
+		return errors.New("primary key value is required")
+	}
+
+	query := db.databasePrefix(database) +
+		"DELETE FROM " + db.formatTableName(table) +
+		" WHERE " + db.FormatReference(primaryKeyColumnName) +
+		" = @p1"
+
+	_, err := db.Connection.ExecContext(ctx, query, primaryKeyValue)
+
+	return err
+}
+
+func (db *MSSQL) ExecuteDMLStatement(ctx context.Context, database, query string) (string, error) {
+	conn, cleanup, err := db.editorConnection(ctx, database)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+
+	ctx = contextOrBackground(ctx)
+	if query == "" {
+		return "", errors.New("query is required")
+	}
+
+	res, err := conn.ExecContext(ctx, query)
+	if err != nil {
+		return "", err
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("%d rows affected", rowsAffected), nil
+}
+
+// StreamQuery incrementally emits interactive SQL results and honors context
+// cancellation through database/sql.
+func (db *MSSQL) StreamQuery(ctx context.Context, database, query string, maxRows int, onBatch func(QueryBatch) error) (QueryStreamResult, error) {
+	conn, cleanup, err := db.editorConnection(ctx, database)
+	if err != nil {
+		return QueryStreamResult{}, err
+	}
+	defer cleanup()
+
+	return streamQuery(ctx, conn, query, maxRows, onBatch)
+}
+
+func (db *MSSQL) ExecuteQuery(ctx context.Context, database, query string) ([][]string, int, error) {
+	conn, cleanup, err := db.editorConnection(ctx, database)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer cleanup()
+
+	ctx = contextOrBackground(ctx)
+	if query == "" {
+		return nil, 0, errors.New("query can not be empty")
+	}
+
+	rows, err := conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	records := make([][]string, 0)
+	for rows.Next() {
+		rowValues := make([]any, len(columns))
+
+		for i := range columns {
+			rowValues[i] = new(sql.RawBytes)
+		}
+
+		if err := rows.Scan(rowValues...); err != nil {
+			return nil, 0, err
+		}
+
+		var row []string
+		for _, col := range rowValues {
+			row = append(row, string(*col.(*sql.RawBytes)))
+		}
+
+		records = append(records, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	// Prepend the columns to the records.
+	results := append([][]string{columns}, records...)
+
+	return results, len(records), nil
+}
+
+func (db *MSSQL) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
+	ctx = contextOrBackground(ctx)
+	var queries []models.Query
+
+	for _, change := range changes {
+
+		formattedTableName := db.formatTableName(change.Table)
+
+		switch change.Type {
+
+		case models.DMLInsertType:
+			queries = append(queries, buildInsertQuery(formattedTableName, change.Values, db))
+		case models.DMLUpdateType:
+			queries = append(queries, buildUpdateQuery(formattedTableName, change.Values, change.PrimaryKeyInfo, db))
+		case models.DMLDeleteType:
+			queries = append(queries, buildDeleteQuery(formattedTableName, change.PrimaryKeyInfo, db))
+		}
+	}
+
+	logger.Info("queries", map[string]any{"queries": queries})
+
+	return queriesInTransaction(ctx, db.Connection, queries)
+}
+
+func (db *MSSQL) GetPrimaryKeyColumnNames(ctx context.Context, database, table string) ([]string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+
+	if table == "" {
+		return nil, errors.New("table name is required")
+	}
+
+	schema, tableName, qualified, err := splitMSSQLTableReference(table)
+	if err != nil {
+		return nil, err
+	}
+	if !qualified {
+		schema, err = db.getCurrentSchema(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	pkColumnName := make([]string, 0)
+
+	query := db.databasePrefix(database) + `
+		SELECT
+			c.name AS column_name
+		FROM
+			sys.tables t
+		INNER JOIN
+			sys.schemas s
+				ON t.schema_id = s.schema_id
+		INNER JOIN
+			sys.key_constraints kc
+				ON t.object_id = kc.parent_object_id
+				AND kc.type = @p1
+		INNER JOIN
+			sys.index_columns ic
+				ON kc.unique_index_id = ic.index_id
+				AND t.object_id = ic.object_id
+		INNER JOIN
+			sys.columns c
+				ON ic.column_id = c.column_id
+				AND t.object_id = c.object_id
+		WHERE
+			s.name = @p2
+			AND t.name = @p3
+		ORDER BY ic.key_ordinal
+	`
+
+	rows, err := db.Connection.QueryContext(ctx, query, "PK", schema, tableName)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var colName string
+
+		if err := rows.Scan(&colName); err != nil {
+			return nil, err
+		}
+
+		pkColumnName = append(pkColumnName, colName)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return pkColumnName, nil
+}
+
+func (db *MSSQL) SetProvider(provider string) {
+	db.Provider = provider
+}
+
+func (db *MSSQL) GetProvider() string {
+	return db.Provider
+}
+
+// getTableInformation is used for following func:
+//
+//   - [GetTableColumns]
+//   - [GetConstraints]
+//   - [GetForeignKeys]
+//   - [GetIndexes]
+//
+// getTableInformation requires following parameter:
+//
+//   - database name, used for filtering table_catalog
+//   - table name, used for filtering table_name
+func (db *MSSQL) getTableInformation(ctx context.Context, query, database, table, schema string) ([][]string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+
+	if table == "" {
+		return nil, errors.New("table name is required")
+	}
+
+	if query == "" {
+		return nil, errors.New("query can not be empty")
+	}
+
+	results := make([][]string, 0)
+
+	args := []any{database, table}
+
+	if schema != "" {
+		args = append(args, schema)
+	}
+
+	rows, err := db.Connection.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	results = append(results, columns)
+
+	for rows.Next() {
+		rowValues := make([]any, len(columns))
+
+		for i := range columns {
+			rowValues[i] = new(sql.RawBytes)
+		}
+
+		if err := rows.Scan(rowValues...); err != nil {
+			return nil, err
+		}
+
+		var row []string
+		for _, col := range rowValues {
+			row = append(row, string(*col.(*sql.RawBytes)))
+		}
+
+		results = append(results, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return results, nil
+}
+
+func (db *MSSQL) FormatArg(arg any, colType models.CellValueType) any {
+	if colType == models.Null {
+		return sql.NullString{
+			String: "",
+			Valid:  false,
+		}
+	}
+
+	if colType == models.Default {
+		return fmt.Sprintf("%v", arg)
+	}
+
+	if colType == models.Empty {
+		return ""
+	}
+
+	if colType == models.String {
+		switch v := arg.(type) {
+
+		case int, int64:
+			return fmt.Sprintf("%v", v)
+		case float64:
+			return fmt.Sprintf("%v", v)
+		case string:
+			return v
+		case []byte:
+			return fmt.Sprintf("0x%x", v)
+		case nil:
+			return sql.NullString{
+				String: "",
+				Valid:  false,
+			}
+		default:
+			return fmt.Sprintf("%v", v)
+		}
+	}
+
+	return fmt.Sprintf("%v", arg)
+}
+
+func (db *MSSQL) FormatArgForQueryString(arg any) string {
+	if arg == "NULL" || arg == "DEFAULT" {
+		return fmt.Sprintf("%v", arg)
+	}
+
+	switch v := arg.(type) {
+
+	case int, int64:
+		return fmt.Sprintf("%v", v)
+	case float64:
+		return fmt.Sprintf("%v", v)
+	case string:
+		escaped := strings.ReplaceAll(v, "'", "''")
+		return fmt.Sprintf("'%s'", escaped)
+	case []byte:
+		return fmt.Sprintf("0x%x", v)
+	case nil:
+		return "NULL"
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func (db *MSSQL) FormatReference(reference string) string {
+	parts := strings.Split(reference, ".")
+	for i, part := range parts {
+		parts[i] = quoteMSSQLIdentifier(part)
+	}
+	return strings.Join(parts, ".")
+}
+
+func (db *MSSQL) FormatPlaceholder(index int) string {
+	return fmt.Sprintf("@p%d", index)
+}
+
+func (db *MSSQL) DMLChangeToQueryString(change models.DBDMLChange) (string, error) {
+	var queryStr string
+
+	formattedTableName := db.formatTableName(change.Table)
+
+	columnNames, values := getColNamesAndArgsAsString(change.Values)
+
+	switch change.Type {
+	case models.DMLInsertType:
+		queryStr = buildInsertQueryString(formattedTableName, columnNames, values, db)
+	case models.DMLUpdateType:
+		queryStr = buildUpdateQueryString(formattedTableName, columnNames, values, change.PrimaryKeyInfo, db)
+	case models.DMLDeleteType:
+		queryStr = buildDeleteQueryString(formattedTableName, change.PrimaryKeyInfo, db)
+
+	}
+
+	return queryStr, nil
+}
+
+func (db *MSSQL) getCurrentSchema(ctx context.Context) (string, error) {
+	ctx = contextOrBackground(ctx)
+	query := "SELECT SCHEMA_NAME() AS CurrentSchema"
+	row := db.Connection.QueryRowContext(ctx, query)
+
+	var currentSchema string
+	err := row.Scan(&currentSchema)
+	if err != nil {
+		return "", err
+	}
+
+	return currentSchema, nil
+}
+
+func (db *MSSQL) GetFunctions(ctx context.Context, database string) (map[string][]string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+
+	functions := make(map[string][]string)
+
+	query := db.databasePrefix(database) + `
+		SELECT s.name + '.' + o.name
+		FROM sys.sql_modules m
+		JOIN sys.objects o ON m.object_id = o.object_id
+		JOIN sys.schemas s ON o.schema_id = s.schema_id
+		WHERE o.type_desc IN ('SQL_SCALAR_FUNCTION', 'SQL_TABLE_VALUED_FUNCTION')
+	`
+
+	rows, err := db.Connection.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var function string
+
+		if err := rows.Scan(&function); err != nil {
+			return nil, err
+		}
+
+		functions[database] = append(functions[database], function)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return functions, nil
+}
+
+func (db *MSSQL) GetProcedures(ctx context.Context, database string) (map[string][]string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+
+	procedures := make(map[string][]string)
+
+	query := db.databasePrefix(database) + `
+		SELECT s.name + '.' + o.name
+		FROM sys.sql_modules m
+		JOIN sys.objects o ON m.object_id = o.object_id
+		JOIN sys.schemas s ON o.schema_id = s.schema_id
+		WHERE o.type_desc IN ('SQL_STORED_PROCEDURE')
+	`
+
+	rows, err := db.Connection.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var procedure string
+
+		if err := rows.Scan(&procedure); err != nil {
+			return nil, err
+		}
+
+		procedures[database] = append(procedures[database], procedure)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return procedures, nil
+}
+
+func (db *MSSQL) SupportsProgramming() bool {
+	return true
+}
+
+func (db *MSSQL) UseSchemas() bool {
+	return true
+}
+
+func (db *MSSQL) GetViews(ctx context.Context, database string) (map[string][]string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+
+	views := make(map[string][]string)
+
+	query := db.databasePrefix(database) + `
+		SELECT s.name + '.' + o.name
+		FROM sys.sql_modules m
+		JOIN sys.objects o ON m.object_id = o.object_id
+		JOIN sys.schemas s ON o.schema_id = s.schema_id
+		WHERE o.type_desc IN ('VIEW')
+	`
+
+	rows, err := db.Connection.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var view string
+
+		if err := rows.Scan(&view); err != nil {
+			return nil, err
+		}
+
+		views[database] = append(views[database], view)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return views, nil
+}
+
+func (db *MSSQL) GetObjectDefinition(ctx context.Context, database string, name string) (string, error) {
+	ctx = contextOrBackground(ctx)
+	if database == "" {
+		return "", errors.New("database name is required")
+	}
+
+	result := ""
+
+	query := db.databasePrefix(database) + `
+	declare @proc_source nvarchar(max);
+    select @proc_source = object_definition(object_id(@name));
+    if charindex('create', @proc_source) > 0 and
+        charindex('create', @proc_source) < charindex(@name, @proc_source)
+    begin
+        set @proc_source = stuff(@proc_source, charindex('create', @proc_source), 6, 'alter')
+    end
+
+    select @proc_source as result;
+	`
+
+	row := db.Connection.QueryRowContext(ctx, query, sql.Named("name", name))
+
+	if err := row.Scan(&result); err != nil {
+		return result, err
+	}
+
+	return result, nil
+}
+
+func (db *MSSQL) GetFunctionDefinition(ctx context.Context, database string, name string) (string, error) {
+	return db.GetObjectDefinition(ctx, database, name)
+}
+
+func (db *MSSQL) GetProcedureDefinition(ctx context.Context, database string, name string) (string, error) {
+	return db.GetObjectDefinition(ctx, database, name)
+}
+
+func (db *MSSQL) GetViewDefinition(ctx context.Context, database string, name string) (string, error) {
+	return db.GetObjectDefinition(ctx, database, name)
+}
+
+func (db *MSSQL) formatTableName(table string) string {
+	schema, tableName, qualified := strings.Cut(table, ".")
+	if !qualified {
+		return quoteMSSQLIdentifier(table)
+	}
+
+	return quoteMSSQLIdentifier(schema) + "." + quoteMSSQLIdentifier(tableName)
+}
+
+// GetReferencingTables discovers reverse foreign keys in the selected database.
+func (db *MSSQL) GetReferencingTables(ctx context.Context, database, table string) ([][]string, error) {
+	query := db.databasePrefix(database) + `
+        SELECT
+            fk.name AS constraint_name,
+            s.name AS table_schema,
+            t.name AS table_name,
+            c.name AS column_name,
+            rc.name AS referenced_column_name
+        FROM sys.foreign_keys fk
+        INNER JOIN sys.foreign_key_columns fkc
+            ON fk.object_id = fkc.constraint_object_id
+        INNER JOIN sys.columns c
+            ON fkc.parent_column_id = c.column_id
+            AND fkc.parent_object_id = c.object_id
+        INNER JOIN sys.columns rc
+            ON fkc.referenced_column_id = rc.column_id
+            AND fkc.referenced_object_id = rc.object_id
+        INNER JOIN sys.tables t
+            ON fk.parent_object_id = t.object_id
+        INNER JOIN sys.schemas s
+            ON t.schema_id = s.schema_id
+        WHERE fk.referenced_object_id = OBJECT_ID(@p2, 'U')
+          AND DB_NAME() = @p1
+        ORDER BY s.name, t.name, fk.name, fkc.constraint_column_id
+    `
+
+	return db.getTableInformation(contextOrBackground(ctx), query, database, table, "")
+}
+
+// editorConnection isolates database selection to one cancelable operation.
+func (db *MSSQL) editorConnection(ctx context.Context, database string) (editorConnection, func(), error) {
+	if database == "" || database == db.CurrentDatabase {
+		return db.Connection, func() {}, nil
+	}
+	return switchedEditorConnection(ctx, db.Connection, "USE "+quoteMSSQLIdentifier(database))
+}
