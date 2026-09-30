@@ -249,3 +249,44 @@ Non-SELECT statements returned their status (`N rows affected`) via
 pagination status was cleared — so running a DELETE/UPDATE looked like nothing
 happened. `runEditorDMLQuery` now also calls `SetQueryStatus(result)`, so the
 count shows in the status line under the results grid.
+
+### Explicit transactions and the transaction panel
+
+Upstream has no transaction support: every editor run goes through a pool, so
+`BEGIN` on one run and `COMMIT` on the next landed on different connections (or
+a throwaway pool) and the transaction was meaningless.
+
+- `drivers/session.go` adds `Session` / `SessionDriver`. `OpenSession` reserves
+  one connection with `pool.Conn(ctx)` and applies a session preamble when
+  needed (MySQL/MSSQL `USE <db>`; PostgreSQL opens a per-database pool and owns
+  it). `Session.StreamQuery` reuses the shared `streamQuery` helper, so reads on
+  a pinned session take the exact same path as pooled reads.
+- Implemented for PostgreSQL, MySQL, MSSQL, SQLite and Oracle. ClickHouse does
+  not implement `SessionDriver`, so `BEGIN` reports that it is unsupported
+  instead of silently doing nothing.
+- `components/results_table_transaction.go` routes an editor statement to the
+  pinned session when the statement opens a transaction (`BEGIN` /
+  `START TRANSACTION`) or when one is already open. `editorRoute` is the single
+  decision point; everything else keeps today's pooled behaviour.
+- `components/transaction_state.go` is the history model (statement, verb, rows,
+  error, outcome) and builds the commit/rollback confirmation text;
+  `components/transaction_panel.go` renders it as panel `[4]` beside the editor.
+- Keybinds: results grid `c` commit / `r` rollback / `i` change cell (was `c`),
+  and the same `c` / `r` in the panel. Both funnel through
+  `confirmTransactionEnd`, which lists the pending statements, tables and row
+  totals before acting.
+- `CancelExactCount`-style cleanup: closing a tab (or quitting) calls
+  `CloseTransaction`, which rolls back and releases the pinned connection.
+
+Two tview traps found while building this, both fixed:
+
+- `Home.focusTab` restores editor focus from a goroutine. It could run *after*
+  the transaction panel had taken focus and steal it back, so the panel keys
+  looked dead (intermittently). `focusTransactionPanel` now uses the new
+  `Home.ensureEditorTab` (which never moves focus) instead of
+  `createOrFocusEditorTab`, so that goroutine is never scheduled in the first
+  place; the remaining goroutine is also guarded by a focus-intent counter.
+- Keys can be routed to the connection page through a stale `hasFocus` flag while
+  a dialog is on top, which let panel shortcuts steal focus from the dialog and
+  leave it undismissable. `Home.homeInputCapture` now checks `ownsFocus()`
+  (`mainPages.GetFrontPage()`) and ignores everything while a dialog is in front.

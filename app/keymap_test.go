@@ -427,6 +427,7 @@ func TestPanelNavigationDefaultBindings(t *testing.T) {
 		{tcell.NewEventKey(tcell.KeyRune, '1', 0), cmd.FocusSchemaPanel},
 		{tcell.NewEventKey(tcell.KeyRune, '2', 0), cmd.FocusEditorPanel},
 		{tcell.NewEventKey(tcell.KeyRune, '3', 0), cmd.FocusResultsPanel},
+		{tcell.NewEventKey(tcell.KeyRune, '4', 0), cmd.FocusTransactionPanel},
 	}
 
 	for _, tc := range cases {
@@ -459,6 +460,46 @@ func TestResultsMenuMovedOffDigits(t *testing.T) {
 	for _, digit := range []rune{'1', '2', '3', '4', '5'} {
 		if got := table.Resolve(tcell.NewEventKey(tcell.KeyRune, digit, 0)); got != cmd.Noop {
 			t.Errorf("table group still resolves digit %q to %s", digit, got)
+		}
+	}
+}
+
+func TestTransactionDefaultBindings(t *testing.T) {
+	table := Keymaps.Group(TableGroup)
+
+	// The grid now uses c/r for the transaction and i for editing a cell.
+	grid := []struct {
+		r    rune
+		want cmd.Command
+	}{
+		{'c', cmd.CommitTransaction},
+		{'r', cmd.RollbackTransaction},
+		{'i', cmd.Edit},
+		{'d', cmd.Delete},
+	}
+	for _, tc := range grid {
+		if got := table.Resolve(tcell.NewEventKey(tcell.KeyRune, tc.r, 0)); got != tc.want {
+			t.Errorf("table group resolved %q to %s, want %s", tc.r, got, tc.want)
+		}
+	}
+
+	transaction := Keymaps.Group(TransactionGroup)
+	panel := []struct {
+		event *tcell.EventKey
+		want  cmd.Command
+	}{
+		{tcell.NewEventKey(tcell.KeyRune, 'c', 0), cmd.CommitTransaction},
+		{tcell.NewEventKey(tcell.KeyRune, 'r', 0), cmd.RollbackTransaction},
+		{tcell.NewEventKey(tcell.KeyRune, 'x', 0), cmd.ClearTransactionHistory},
+		{tcell.NewEventKey(tcell.KeyRune, 'y', 0), cmd.Copy},
+		{tcell.NewEventKey(tcell.KeyRune, 'j', 0), cmd.MoveDown},
+		{tcell.NewEventKey(tcell.KeyRune, 'k', 0), cmd.MoveUp},
+		{tcell.NewEventKey(tcell.KeyRune, 'q', 0), cmd.Quit},
+		{tcell.NewEventKey(tcell.KeyEscape, 0, 0), cmd.Quit},
+	}
+	for _, tc := range panel {
+		if got := transaction.Resolve(tc.event); got != tc.want {
+			t.Errorf("transaction group resolved %q to %s, want %s", tc.event.Name(), got, tc.want)
 		}
 	}
 }

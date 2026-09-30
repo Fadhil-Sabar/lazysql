@@ -727,6 +727,26 @@ func (db *Postgres) ExecuteDMLStatement(ctx context.Context, database, query str
 
 // StreamQuery incrementally emits interactive SQL results and honors context
 // cancellation through database/sql.
+// OpenSession pins one connection so an explicit transaction started by BEGIN
+// keeps running across separate editor executions.
+func (db *Postgres) OpenSession(ctx context.Context, database string) (Session, error) {
+	if database == "" {
+		database = db.CurrentDatabase
+	}
+
+	pool, needsClose, err := db.connectionFor(ctx, database)
+	if err != nil {
+		return nil, err
+	}
+
+	var owned func()
+	if needsClose {
+		owned = func() { _ = pool.Close() }
+	}
+
+	return openPinnedSession(ctx, pool, "", owned)
+}
+
 func (db *Postgres) StreamQuery(ctx context.Context, database, query string, maxRows int, onBatch func(QueryBatch) error) (QueryStreamResult, error) {
 	if database == "" {
 		database = db.CurrentDatabase

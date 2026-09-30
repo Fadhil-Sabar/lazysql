@@ -649,6 +649,14 @@ func (db *MSSQL) ExecuteDMLStatement(ctx context.Context, database, query string
 
 // StreamQuery incrementally emits interactive SQL results and honors context
 // cancellation through database/sql.
+// OpenSession pins one connection so an explicit transaction started by BEGIN
+// keeps running across separate editor executions.
+func (db *MSSQL) OpenSession(ctx context.Context, database string) (Session, error) {
+	return openSessionWith(ctx, db.Connection, database, db.CurrentDatabase, func(name string) string {
+		return "USE " + quoteMSSQLIdentifier(name)
+	}, nil)
+}
+
 func (db *MSSQL) StreamQuery(ctx context.Context, database, query string, maxRows int, onBatch func(QueryBatch) error) (QueryStreamResult, error) {
 	conn, cleanup, err := db.editorConnection(ctx, database)
 	if err != nil {

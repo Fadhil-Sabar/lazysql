@@ -658,6 +658,14 @@ func (db *MySQL) ExecuteDMLStatement(ctx context.Context, database, query string
 	return fmt.Sprintf("%d rows affected", rowsAffected), nil
 }
 
+// OpenSession pins one connection so an explicit transaction started by BEGIN
+// keeps running across separate editor executions.
+func (db *MySQL) OpenSession(ctx context.Context, database string) (Session, error) {
+	return openSessionWith(ctx, db.Connection, database, db.CurrentDatabase, func(name string) string {
+		return "USE `" + strings.ReplaceAll(name, "`", "``") + "`"
+	}, nil)
+}
+
 func (db *MySQL) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
 	ctx = contextOrBackground(ctx)
 	var queries []models.Query

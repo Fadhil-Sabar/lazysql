@@ -24,7 +24,11 @@ const (
 	pageNameTableEditorResultsInfo string = "TableEditorResultsInfo"
 	pageNameTableEditCell          string = "TableEditCell"
 	pageNameQueryPreviewError      string = "QueryPreviewError"
-	pageNameJSONViewer                    = "json_viewer"
+
+	// Transaction panel dialogs
+	pageNameTransactionConfirm string = "TransactionConfirm"
+	pageNameTransactionInfo    string = "TransactionInfo"
+	pageNameJSONViewer                = "json_viewer"
 
 	// Sidebar
 	pageNameSidebar string = "Sidebar"

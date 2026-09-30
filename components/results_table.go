@@ -33,6 +33,10 @@ const (
 	// minPanelHeight keeps a collapsed-then-resized panel usable.
 	minPanelHeight  = 3
 	panelResizeStep = 2
+	// defaultTxPanelWidth is the width of the transaction panel beside the
+	// editor; minTxPanelWidth keeps it readable when shrunk.
+	defaultTxPanelWidth = 34
+	minTxPanelWidth     = 16
 )
 
 type ResultsTableState struct {
@@ -178,6 +182,20 @@ type ResultsTable struct {
 	editorHeight     int
 	editorCollapsed  bool
 	resultsCollapsed bool
+
+	// Transaction panel and the pinned session backing an explicit
+	// transaction (editor tabs only).
+	TxPanel          *TransactionPanel
+	EditorRow        *tview.Flex
+	txState          *TransactionState
+	txPanelWidth     int
+	txPanelCollapsed bool
+	txMu             sync.Mutex
+	txSession        drivers.Session
+	txDatabase       string
+	// txOwner remembers which panel asked for the commit/rollback so focus can
+	// return there after the confirmation closes.
+	txOwner tview.Primitive
 }
 
 func NewResultsTable(listOfDBChanges *[]models.DBDMLChange, tree *Tree, dbdriver drivers.Driver, home *Home, connectionIdentifier string, connectionURL string, readOnly bool) *ResultsTable {
@@ -328,7 +346,26 @@ func (table *ResultsTable) WithEditor() *ResultsTable {
 
 	table.Wrapper.Clear()
 
-	table.Wrapper.AddItem(editor, table.editorHeight, 0, true)
+	table.txState = NewTransactionState()
+	table.TxPanel = NewTransactionPanel(table.txState)
+	table.TxPanel.SetHandlers(
+		table.CommitTransaction,
+		table.RollbackTransaction,
+		table.ClearTransactionHistory,
+		table.focusEditorFromTransactionPanel,
+	)
+	if table.txPanelWidth == 0 {
+		table.txPanelWidth = defaultTxPanelWidth
+	}
+
+	// The transaction panel deliberately sits beside the editor, not beside
+	// the results grid: its history belongs to the statements typed above it.
+	editorRow := tview.NewFlex().SetDirection(tview.FlexColumn)
+	editorRow.AddItem(editor, 0, 1, true)
+	editorRow.AddItem(table.TxPanel.Wrapper, table.txPanelWidth, 0, false)
+	table.EditorRow = editorRow
+
+	table.Wrapper.AddItem(editorRow, table.editorHeight, 0, true)
 	table.SetBorder(true)
 	table.SetTitle(" [3] Results ")
 	table.SetTitleColor(app.Styles.PrimaryTextColor)
@@ -363,18 +400,77 @@ func (table *ResultsTable) applyEditorSplit() {
 		return
 	}
 
+	editorItem := table.editorSplitItem()
+
 	switch {
 	case table.editorCollapsed:
-		table.Wrapper.ResizeItem(table.Editor, 0, 0)
+		table.Wrapper.ResizeItem(editorItem, 0, 0)
 		table.Wrapper.ResizeItem(table.EditorPages, 0, 1)
 	case table.resultsCollapsed:
-		table.Wrapper.ResizeItem(table.Editor, 0, 1)
+		table.Wrapper.ResizeItem(editorItem, 0, 1)
 		table.Wrapper.ResizeItem(table.EditorPages, 0, 0)
 	default:
-		table.Wrapper.ResizeItem(table.Editor, table.editorHeight, 0)
+		table.Wrapper.ResizeItem(editorItem, table.editorHeight, 0)
 		table.Wrapper.ResizeItem(table.EditorPages, 0, 1)
 	}
 
+	table.applyTxPanelWidth()
+
+	App.ForceDraw()
+}
+
+// editorSplitItem is the primitive that resizes with the editor split: the
+// editor row (editor + transaction panel) when it exists, or the bare editor.
+func (table *ResultsTable) editorSplitItem() tview.Primitive {
+	if table.EditorRow != nil {
+		return table.EditorRow
+	}
+	return table.Editor
+}
+
+// applyTxPanelWidth pushes the stored transaction panel width to the layout.
+func (table *ResultsTable) applyTxPanelWidth() {
+	if table.EditorRow == nil || table.TxPanel == nil {
+		return
+	}
+
+	if table.txPanelCollapsed {
+		table.EditorRow.ResizeItem(table.TxPanel.Wrapper, 0, 0)
+		return
+	}
+
+	table.EditorRow.ResizeItem(table.TxPanel.Wrapper, table.txPanelWidth, 0)
+}
+
+// resizeTxPanel changes the width of the transaction panel beside the editor.
+func (table *ResultsTable) resizeTxPanel(delta int) {
+	if table.TxPanel == nil {
+		return
+	}
+
+	_, _, totalWidth, _ := table.Wrapper.GetInnerRect()
+	table.txPanelWidth = nextTxPanelWidth(table.txPanelWidth, delta, totalWidth)
+	table.txPanelCollapsed = false
+	table.applyTxPanelWidth()
+	App.ForceDraw()
+}
+
+// nextTxPanelWidth clamps the transaction panel so it never takes over the
+// editor row or shrinks below a readable width.
+func nextTxPanelWidth(current, delta, totalWidth int) int {
+	maxWidth := max(totalWidth/2, minTxPanelWidth)
+	next := max(current+delta, minTxPanelWidth)
+	return min(next, maxWidth)
+}
+
+// toggleTxPanel collapses or restores the transaction panel.
+func (table *ResultsTable) toggleTxPanel() {
+	if table.TxPanel == nil {
+		return
+	}
+
+	table.txPanelCollapsed = !table.txPanelCollapsed
+	table.applyTxPanelWidth()
 	App.ForceDraw()
 }
 
@@ -769,6 +865,17 @@ func (table *ResultsTable) tableInputCapture(event *tcell.EventKey) *tcell.Event
 		return nil
 	}
 
+	// Transaction actions must work even when the grid only has its header row,
+	// which is the normal state right after a DML statement.
+	if command == commands.CommitTransaction {
+		table.CommitTransaction()
+		return nil
+	}
+	if command == commands.RollbackTransaction {
+		table.RollbackTransaction()
+		return nil
+	}
+
 	menuCommands := []commands.Command{commands.RecordsMenu, commands.ColumnsMenu, commands.ConstraintsMenu, commands.ForeignKeysMenu, commands.IndexesMenu}
 
 	if helpers.ContainsCommand(menuCommands, command) {
@@ -813,7 +920,9 @@ func (table *ResultsTable) tableInputCapture(event *tcell.EventKey) *tcell.Event
 			table.SetError("Cannot modify data: Connection is in read-only mode", nil)
 			return nil
 		}
-		if table.Menu.GetSelectedOption() == 1 {
+		// Editor tabs render query results, not a table, so they have no
+		// records menu and cannot append rows.
+		if table.Menu != nil && table.Menu.GetSelectedOption() == 1 {
 			table.appendNewRow()
 		}
 	case commands.DuplicateRow:
@@ -821,7 +930,7 @@ func (table *ResultsTable) tableInputCapture(event *tcell.EventKey) *tcell.Event
 			table.SetError("Cannot modify data: Connection is in read-only mode", nil)
 			return nil
 		}
-		if table.Menu.GetSelectedOption() == 1 {
+		if table.Menu != nil && table.Menu.GetSelectedOption() == 1 {
 			table.duplicateRow()
 		}
 	case commands.Search:
@@ -1171,6 +1280,11 @@ func (table *ResultsTable) subscribeToEditorChanges() {
 			}
 
 			isSelect := isResultProducingQuery(query)
+			verb := leadingQueryVerb(query)
+			// A statement runs on the pinned transaction session when the
+			// editor is inside an explicit transaction, or when the statement
+			// itself opens one (BEGIN / START TRANSACTION).
+			route := table.editorRoute(query, verb)
 
 			// Clear existing records immediately for SQL editor queries and start
 			// a cancellable loading cycle on the UI goroutine. The active query is
@@ -1197,9 +1311,12 @@ func (table *ResultsTable) subscribeToEditorChanges() {
 				run = table.beginEditorQuery(generation)
 			})
 
-			if isSelect {
+			switch {
+			case route == editorRouteSession:
+				go table.runEditorTransactionStatement(ctx, run, query, verb)
+			case isSelect:
 				go table.runEditorStreamQuery(ctx, run, query)
-			} else {
+			default:
 				go table.runEditorDMLQuery(ctx, run, query)
 			}
 

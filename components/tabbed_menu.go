@@ -150,6 +150,8 @@ func (t *TabbedPane) RemoveCurrentTab() *Tab {
 
 	if currentTab != nil {
 		if table, ok := currentTab.Content.(*ResultsTable); ok {
+			// Closing a tab must not leave a transaction holding locks.
+			table.CloseTransaction()
 			table.CancelExactCount()
 			table.cancelMetadataContext()
 		}

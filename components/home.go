@@ -39,6 +39,10 @@ type Home struct {
 	metadataCache        *metadataCache
 	metadataCacheMu      sync.Mutex
 	schemaLoader         *schemaLoader
+	// focusIntent counts explicit "focus this panel" requests. focusTab
+	// restores editor focus from a goroutine and must skip that restore when a
+	// newer intent (for example the transaction panel) has taken over.
+	focusIntent uint64
 }
 
 func NewHomePage(connection models.Connection, dbdriver drivers.Driver) *Home {
@@ -410,9 +414,18 @@ func (home *Home) focusTab(tab *Tab) {
 	if tab != nil {
 		table := tab.Content.(*ResultsTable)
 		table.HighlightAll()
+		table.blurTransactionPanel()
 
 		if table.GetIsFiltering() {
+			intent := home.focusIntent
 			go func() {
+				// This runs asynchronously. Skip the restore when a newer
+				// focus request (another panel, the transaction panel) has
+				// been made in the meantime, so it cannot steal focus.
+				if home.focusIntent != intent {
+					return
+				}
+
 				if table.Filter != nil {
 					app.App.SetFocus(table.Filter.Input)
 					table.Filter.HighlightLocal()
@@ -449,6 +462,7 @@ func (home *Home) focusLeftWrapper() {
 		table := tab.Content.(*ResultsTable)
 
 		table.RemoveHighlightAll()
+		table.blurTransactionPanel()
 
 	}
 
@@ -469,6 +483,7 @@ const (
 	panelSchema panel = iota
 	panelEditor
 	panelResults
+	panelTransaction
 )
 
 // panelForFocus maps the wrapper/editor state to the panel that owns focus.
@@ -497,8 +512,12 @@ func panelNumberAllowed(editorFocused, editorInsert, tableFocused, treeFocused, 
 	}
 }
 
-// currentPanel reports which of the three panels currently owns focus.
+// currentPanel reports which of the four panels currently owns focus.
 func (home *Home) currentPanel() panel {
+	if table := home.currentResultsTable(); table != nil && table.TxPanel != nil && table.TxPanel.HasFocus() {
+		return panelTransaction
+	}
+
 	hasTab := false
 	editorFocused := false
 
@@ -518,6 +537,10 @@ func (home *Home) canUsePanelShortcuts() bool {
 	focus := app.App.GetFocus()
 	if focus == nil {
 		return false
+	}
+
+	if table := home.currentResultsTable(); table != nil && table.TxPanel != nil && table.TxPanel.HasFocus() {
+		return true
 	}
 
 	editorFocused, editorInsert := false, false
@@ -546,6 +569,7 @@ func (home *Home) focusSchemaPanel() {
 		return
 	}
 
+	home.focusIntent++
 	home.focusLeftWrapper()
 	app.App.ForceDraw()
 }
@@ -553,8 +577,36 @@ func (home *Home) focusSchemaPanel() {
 func (home *Home) focusEditorPanel() {
 	home.createOrFocusEditorTab()
 	if table := home.currentResultsTable(); table != nil {
+		table.blurTransactionPanel()
 		table.expandEditorPanel()
 	}
+}
+
+// focusTransactionPanel focuses the transaction history panel beside the
+// editor, creating an editor tab first when the connection has none.
+func (home *Home) focusTransactionPanel() {
+	// ensureEditorTab (not createOrFocusEditorTab) so no asynchronous editor
+	// focus restore is scheduled behind us.
+	table := home.ensureEditorTab()
+	if table == nil || table.TxPanel == nil {
+		return
+	}
+
+	home.focusIntent++
+
+	home.Tree.RemoveHighlight()
+	home.RightWrapper.SetBorderColor(app.Styles.PrimaryTextColor)
+	home.LeftWrapper.SetBorderColor(app.Styles.InverseTextColor)
+	home.TabbedPane.Highlight()
+	table.HighlightAll()
+	table.RemoveHighlightTable()
+	if table.Editor != nil {
+		table.Editor.SetBlur()
+	}
+
+	home.FocusedWrapper = focusedWrapperRight
+	home.HelpStatus.SetStatusOnEditorView()
+	table.focusTransactionPanel()
 }
 
 // focusResultsPanel focuses the result grid of the current tab while keeping
@@ -588,6 +640,7 @@ func (home *Home) focusResultsPanel() {
 		table.Editor.SetBlur()
 	}
 	table.SetInputCapture(table.tableInputCapture)
+	home.focusIntent++
 	app.App.SetFocus(table)
 
 	home.FocusedWrapper = focusedWrapperRight
@@ -609,25 +662,37 @@ func (home *Home) focusLastRightPanel() {
 }
 
 func (home *Home) panelMoveLeft() {
-	if home.currentPanel() != panelSchema {
+	switch home.currentPanel() {
+	case panelSchema:
+		return
+	case panelTransaction:
+		home.focusEditorPanel()
+	default:
 		home.focusSchemaPanel()
 	}
 }
 
 func (home *Home) panelMoveRight() {
-	if home.currentPanel() == panelSchema {
+	switch home.currentPanel() {
+	case panelSchema:
 		home.focusLastRightPanel()
+	case panelEditor:
+		if table := home.currentResultsTable(); table != nil && table.transactionPanelVisible() {
+			home.focusTransactionPanel()
+		}
 	}
 }
 
 func (home *Home) panelMoveUp() {
-	if home.currentPanel() == panelResults {
+	switch home.currentPanel() {
+	case panelResults, panelTransaction:
 		home.focusEditorPanel()
 	}
 }
 
 func (home *Home) panelMoveDown() {
-	if home.currentPanel() == panelEditor {
+	switch home.currentPanel() {
+	case panelEditor, panelTransaction:
 		home.focusResultsPanel()
 	}
 }
@@ -640,6 +705,31 @@ func (home *Home) currentResultsTable() *ResultsTable {
 	}
 	table, _ := tab.Content.(*ResultsTable)
 	return table
+}
+
+// ownsFocus reports whether this connection page is the front page. Any modal
+// dialog added above it (confirmation, help, error, connection list, ...) takes
+// the keyboard for as long as it is visible.
+func (home *Home) ownsFocus() bool {
+	return homeOwnsFrontPage(mainPages, home)
+}
+
+// homeOwnsFrontPage reports whether home is the front page of pages. It is a
+// separate function so the dialog-focus rule can be tested without an
+// application.
+func homeOwnsFrontPage(pages *tview.Pages, home *Home) bool {
+	if pages == nil {
+		return true
+	}
+
+	_, front := pages.GetFrontPage()
+	if front == nil {
+		return false
+	}
+
+	// The page item is the Home when it is opened interactively, and the bare
+	// Flex when it is opened from a connection URL argument.
+	return front == tview.Primitive(home) || front == tview.Primitive(home.Flex)
 }
 
 // panelGrow makes the focused panel larger along its natural axis.
@@ -656,6 +746,10 @@ func (home *Home) panelGrow() {
 	case panelResults:
 		if table := home.currentResultsTable(); table != nil {
 			table.resizeEditorPanel(-panelResizeStep)
+		}
+	case panelTransaction:
+		if table := home.currentResultsTable(); table != nil {
+			table.resizeTxPanel(panelResizeStep)
 		}
 	}
 }
@@ -675,6 +769,10 @@ func (home *Home) panelShrink() {
 		if table := home.currentResultsTable(); table != nil {
 			table.resizeEditorPanel(panelResizeStep)
 		}
+	case panelTransaction:
+		if table := home.currentResultsTable(); table != nil {
+			table.resizeTxPanel(-panelResizeStep)
+		}
 	}
 }
 
@@ -690,6 +788,10 @@ func (home *Home) panelToggleCollapse() {
 	case panelResults:
 		if table := home.currentResultsTable(); table != nil {
 			table.toggleResultsPanel()
+		}
+	case panelTransaction:
+		if table := home.currentResultsTable(); table != nil {
+			table.toggleTxPanel()
 		}
 	}
 }
@@ -707,6 +809,13 @@ func (home *Home) isCurrentTabFiltering() bool {
 
 func (home *Home) rightWrapperInputCapture(event *tcell.EventKey) *tcell.EventKey {
 	var tab *Tab
+
+	// The transaction panel owns the keyboard while it is focused: its own
+	// group handles commit/rollback/navigation, and the tab shortcuts must not
+	// fire underneath it (X would close the tab and silently roll back).
+	if table := home.currentResultsTable(); table != nil && table.TxPanel != nil && table.TxPanel.HasFocus() {
+		return event
+	}
 
 	command := app.Keymaps.Group(app.TableGroup).Resolve(event)
 
@@ -825,6 +934,18 @@ func (home *Home) rightWrapperInputCapture(event *tcell.EventKey) *tcell.EventKe
 }
 
 func (home *Home) homeInputCapture(event *tcell.EventKey) *tcell.EventKey {
+	// While a dialog (confirmation, help, error, ...) is above this connection
+	// page it owns the keyboard. tview can still route a key here through a
+	// stale focus flag, and acting on it would steal focus from the dialog and
+	// leave it undismissable.
+	if !home.ownsFocus() {
+		return event
+	}
+	if t := home.currentResultsTable(); t != nil {
+	}
+	if t := home.currentResultsTable(); t != nil {
+	}
+
 	tab := home.TabbedPane.GetCurrentTab()
 
 	var table *ResultsTable
@@ -882,6 +1003,12 @@ func (home *Home) homeInputCapture(event *tcell.EventKey) *tcell.EventKey {
 			return nil
 		}
 		return event
+	case commands.FocusTransactionPanel:
+		if home.canUsePanelShortcuts() {
+			home.focusTransactionPanel()
+			return nil
+		}
+		return event
 	case commands.GrowPanel:
 		if home.canUsePanelShortcuts() {
 			home.panelGrow()
@@ -913,11 +1040,22 @@ func (home *Home) homeInputCapture(event *tcell.EventKey) *tcell.EventKey {
 			mainPages.SwitchToPage(pageNameConnections)
 		}
 	case commands.Quit:
+		// Inside the transaction panel q means "leave the panel".
+		if table != nil && table.TxPanel != nil && table.TxPanel.HasFocus() {
+			return event
+		}
 		if tab == nil || (!table.GetIsEditing() && !table.GetIsFiltering()) {
 			showQuitConfirmation()
 			return nil
 		}
 	case commands.Save:
+		// Applying grid changes opens its own transaction on another
+		// connection. While an editor transaction is open that would fight
+		// over the same rows, so make the user finish it first.
+		if table != nil && table.hasActiveTransaction() {
+			table.showTransactionInfo("A transaction is open in this tab.\n\nCommit with c or roll back with r before executing pending cell changes.")
+			return nil
+		}
 		if home.ReadOnly {
 			errorModal := tview.NewModal().
 				SetText("Cannot save changes: Connection is in read-only mode").
@@ -1006,7 +1144,11 @@ func (home *Home) homeInputCapture(event *tcell.EventKey) *tcell.EventKey {
 	return event
 }
 
-func (home *Home) createOrFocusEditorTab() {
+// ensureEditorTab makes the editor tab the current tab (creating it when the
+// connection has none) and returns it. It deliberately does not move keyboard
+// focus: callers pick the panel, which keeps this safe to use from
+// focusTransactionPanel without racing an asynchronous editor focus restore.
+func (home *Home) ensureEditorTab() *ResultsTable {
 	tab := home.TabbedPane.GetTabByName(tabNameEditor)
 	dbName := home.Tree.GetSelectedDatabase()
 
@@ -1024,24 +1166,29 @@ func (home *Home) createOrFocusEditorTab() {
 			table.SetDatabaseName(dbName)
 			go table.loadEditorSchema()
 		}
-	} else {
-		tableWithEditor := NewResultsTable(&home.ListOfDBChanges, home.Tree, home.DBDriver, home, home.ConnectionIdentifier, home.ConnectionURL, home.ReadOnly)
-		// Set database name before WithEditor so the table is ready for schema loading
-		if dbName != "" {
-			tableWithEditor.SetDatabaseName(dbName)
-		}
-		tableWithEditor = tableWithEditor.WithEditor()
-
-		// Kick off schema loading for autocomplete (async, non-blocking)
-		if dbName != "" && tableWithEditor.DBDriver != nil {
-			go tableWithEditor.loadEditorSchema()
-		}
-
-		home.TabbedPane.AppendTab(tabNameEditor, tableWithEditor, tabNameEditor)
-		tableWithEditor.SetIsFiltering(true)
-		home.TabbedPane.GetCurrentTab()
+		return table
 	}
 
+	tableWithEditor := NewResultsTable(&home.ListOfDBChanges, home.Tree, home.DBDriver, home, home.ConnectionIdentifier, home.ConnectionURL, home.ReadOnly)
+	// Set database name before WithEditor so the table is ready for schema loading
+	if dbName != "" {
+		tableWithEditor.SetDatabaseName(dbName)
+	}
+	tableWithEditor = tableWithEditor.WithEditor()
+
+	// Kick off schema loading for autocomplete (async, non-blocking)
+	if dbName != "" && tableWithEditor.DBDriver != nil {
+		go tableWithEditor.loadEditorSchema()
+	}
+
+	home.TabbedPane.AppendTab(tabNameEditor, tableWithEditor, tabNameEditor)
+	tableWithEditor.SetIsFiltering(true)
+	home.TabbedPane.GetCurrentTab()
+	return tableWithEditor
+}
+
+func (home *Home) createOrFocusEditorTab() {
+	home.ensureEditorTab()
 	home.HelpStatus.SetStatusOnEditorView()
 	home.focusRightWrapper()
 	App.ForceDraw()

@@ -465,6 +465,14 @@ func (db *Oracle) ExecuteDMLStatement(ctx context.Context, database, query strin
 
 // StreamQuery incrementally emits interactive SQL results and honors context
 // cancellation through database/sql.
+// OpenSession pins one connection so an explicit transaction started by BEGIN
+// keeps running across separate editor executions. For Oracle the database
+// argument is a schema and statements are schema-qualified, so no session
+// preamble is needed.
+func (db *Oracle) OpenSession(ctx context.Context, _ string) (Session, error) {
+	return openPinnedSession(ctx, db.Connection, "", nil)
+}
+
 func (db *Oracle) StreamQuery(ctx context.Context, database, query string, maxRows int, onBatch func(QueryBatch) error) (QueryStreamResult, error) {
 	return streamQuery(ctx, db.Connection, query, maxRows, onBatch)
 }

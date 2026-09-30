@@ -54,6 +54,7 @@ const (
 	QueryHistoryGroup = "queryhistory"
 	TabbedMenuGroup   = "tabbedmenu"
 	JSONViewerGroup   = "jsonviewer"
+	TransactionGroup  = "transaction"
 )
 
 // Define a global KeymapSystem object with default keybinds
@@ -72,6 +73,7 @@ var Keymaps = KeymapSystem{
 			Bind{Key: Key{Char: '1'}, Cmd: cmd.FocusSchemaPanel, Description: "Focus schema panel"},
 			Bind{Key: Key{Char: '2'}, Cmd: cmd.FocusEditorPanel, Description: "Focus SQL editor"},
 			Bind{Key: Key{Char: '3'}, Cmd: cmd.FocusResultsPanel, Description: "Focus results"},
+			Bind{Key: Key{Char: '4'}, Cmd: cmd.FocusTransactionPanel, Description: "Focus transaction panel"},
 			Bind{Key: Key{Code: tcell.KeyCtrlE}, Cmd: cmd.SwitchToEditorView, Description: "Open SQL editor"},
 			Bind{Key: Key{Code: tcell.KeyCtrlS}, Cmd: cmd.Save, Description: "Execute pending changes"},
 			Bind{Key: Key{Char: 'q'}, Cmd: cmd.Quit, Description: "Quit"},
@@ -119,7 +121,9 @@ var Keymaps = KeymapSystem{
 		},
 		TableGroup: {
 			Bind{Key: Key{Char: '/'}, Cmd: cmd.Search, Description: "Search"},
-			Bind{Key: Key{Char: 'c'}, Cmd: cmd.Edit, Description: "Change cell"},
+			Bind{Key: Key{Char: 'c'}, Cmd: cmd.CommitTransaction, Description: "Commit transaction"},
+			Bind{Key: Key{Char: 'r'}, Cmd: cmd.RollbackTransaction, Description: "Rollback transaction"},
+			Bind{Key: Key{Char: 'i'}, Cmd: cmd.Edit, Description: "Change cell"},
 			Bind{Key: Key{Char: 'd'}, Cmd: cmd.Delete, Description: "Delete row"},
 			Bind{Key: Key{Char: 'w'}, Cmd: cmd.GotoNext, Description: "Go to next cell"},
 			Bind{Key: Key{Char: 'b'}, Cmd: cmd.GotoPrev, Description: "Go to previous cell"},
@@ -201,6 +205,20 @@ var Keymaps = KeymapSystem{
 			Bind{Key: Key{Char: 'z'}, Cmd: cmd.ShowCellJSONViewer, Description: "Toggle JSON viewer"},
 			Bind{Key: Key{Char: 'y'}, Cmd: cmd.Copy, Description: "Copy value to clipboard"},
 			Bind{Key: Key{Char: 'w'}, Cmd: cmd.ToggleJSONViewerWrap, Description: "Toggle word wrap"},
+		},
+		TransactionGroup: {
+			Bind{Key: Key{Char: 'c'}, Cmd: cmd.CommitTransaction, Description: "Commit transaction"},
+			Bind{Key: Key{Char: 'r'}, Cmd: cmd.RollbackTransaction, Description: "Rollback transaction"},
+			Bind{Key: Key{Char: 'x'}, Cmd: cmd.ClearTransactionHistory, Description: "Clear finished history"},
+			Bind{Key: Key{Char: 'y'}, Cmd: cmd.Copy, Description: "Copy statement to clipboard"},
+			Bind{Key: Key{Char: 'j'}, Cmd: cmd.MoveDown, Description: "Next statement"},
+			Bind{Key: Key{Char: 'k'}, Cmd: cmd.MoveUp, Description: "Previous statement"},
+			Bind{Key: Key{Code: tcell.KeyDown}, Cmd: cmd.MoveDown, Description: "Next statement"},
+			Bind{Key: Key{Code: tcell.KeyUp}, Cmd: cmd.MoveUp, Description: "Previous statement"},
+			Bind{Key: Key{Char: 'g'}, Cmd: cmd.GotoStart, Description: "First statement"},
+			Bind{Key: Key{Char: 'G'}, Cmd: cmd.GotoEnd, Description: "Last statement"},
+			Bind{Key: Key{Char: 'q'}, Cmd: cmd.Quit, Description: "Back to editor"},
+			Bind{Key: Key{Code: tcell.KeyEscape}, Cmd: cmd.Quit, Description: "Back to editor"},
 		},
 	},
 }

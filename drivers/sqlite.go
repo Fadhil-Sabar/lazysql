@@ -591,6 +591,12 @@ func (db *SQLite) ExecuteDMLStatement(ctx context.Context, _, query string) (res
 	return fmt.Sprintf("%d rows affected", rowsAffected), nil
 }
 
+// OpenSession pins one connection so an explicit transaction started by BEGIN
+// keeps running across separate editor executions.
+func (db *SQLite) OpenSession(ctx context.Context, _ string) (Session, error) {
+	return openPinnedSession(ctx, db.Connection, "", nil)
+}
+
 func (db *SQLite) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
 	ctx = contextOrBackground(ctx)
 	var queries []models.Query

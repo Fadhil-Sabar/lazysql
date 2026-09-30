@@ -70,18 +70,55 @@ Semicolons inside `'…'`, `"…"`, `` `…` ``, `--` comments and `/* … */` b
 ignored. Visual mode selection is inclusive of the cursor character and supports
 the `w` / `b` / `e` word motions.
 
+### Transactions (explicit COMMIT / ROLLBACK)
+
+`BEGIN` (or `START TRANSACTION`) opens a **pinned session**: from that statement
+on, every `Ctrl+R` in the tab runs on the same connection, so the transaction
+survives across runs until `COMMIT` / `ROLLBACK`. Statements inside it see your
+own uncommitted writes; other sessions do not.
+
+Every execution is listed in the **transaction panel** (`[4] Transaction`) beside
+the editor with its row count and state (`autocommit`, `pending`, `committed`,
+`rolled back`, `failed`).
+
+| Key | Action |
+| --- | --- |
+| `c` | commit the open transaction |
+| `r` | roll back the open transaction |
+| `x` | drop finished history entries |
+| `y` | copy the highlighted statement |
+| `j` / `k` | walk the history |
+| `q` / `Esc` | back to the editor |
+
+The same `c` / `r` work on the results grid. Both ask for confirmation first: the
+dialog lists the pending statements, the tables affected, the total rows and when
+the transaction started. `Esc` / `No` cancels it.
+
+Worth knowing:
+
+- Closing the tab rolls an open transaction back, so a forgotten transaction
+  cannot keep holding locks.
+- `Ctrl+S` (execute grid pending changes) is refused while a transaction is open;
+  finish it with `c` / `r` first. This keeps the two write paths from fighting
+  over the same rows.
+- A `SELECT` inside a transaction is read-your-writes but is not streamed, so it
+  uses the configured query row cap.
+- Drivers without interactive transactions (ClickHouse) report that `BEGIN` is
+  unsupported and keep working as before.
+
 ### Panels
 
-Three focusable panels: **schema** (left), **SQL editor** (right, top) and
-**results** (right, bottom). Border titles show their focus digit (`[1] Databases`,
-`[2] Editor`, `[3] Results`).
+Four focusable panels: **schema** (left), **SQL editor** (right, top),
+**results** (right, bottom) and **transaction** (right, beside the editor).
+Border titles show their focus digit (`[1] Databases`, `[2] Editor`,
+`[3] Results`, `[4] Transaction`).
 
 | Key | Action |
 | --- | --- |
 | `Ctrl+H` | focus schema panel |
-| `Ctrl+L` | return to the editor/results panel in use |
-| `Ctrl+K` / `Ctrl+J` | up: results → editor / down: editor → results |
-| `1` / `2` / `3` | focus schema / editor / results |
+| `Ctrl+L` | move right: schema → editor → transaction panel |
+| `Ctrl+K` / `Ctrl+J` | up: results/transaction → editor / down: editor/transaction → results |
+| `1` / `2` / `3` / `4` | focus schema / editor / results / transaction |
 | `+`, `=` / `-` | grow / shrink the focused panel |
 | `T` | collapse / expand the focused panel |
 
@@ -163,8 +200,10 @@ full configuration reference, themes, and the manual DB test environment.
 | Context | Keys |
 | --- | --- |
 | Connection picker | `/` filter · `s` sort · `c`/`Enter` connect · `n` new · `e` edit · `d` delete · `q` quit |
-| Panels | `Ctrl+H/J/K/L` navigate · `1/2/3` focus · `+`/`-` resize · `T` collapse |
+| Panels | `Ctrl+H/J/K/L` navigate · `1/2/3/4` focus · `+`/`-` resize · `T` collapse |
 | Editor | `/` `?` `Ctrl+F` search · `n`/`N` `*`/`#` matches · `Ctrl+R`/`Ctrl+E` run · `Ctrl+V` paste · `Ctrl+Space` external editor |
+| Results grid | `c` commit · `r` rollback · `i` change cell · `d` delete row · `Ctrl+S` run pending changes |
+| Transaction panel | `c` commit · `r` rollback · `x` clear · `y` copy · `j`/`k` history · `q` back |
 | Home | `Ctrl+E` editor · `Ctrl+S` run pending changes · `Ctrl+P` global search · `Ctrl+_` query history · `Backspace` connections · `?` help · `q` quit |
 
 Full tables (Home, Tree, Table, Sidebar, JSON viewer, …) are in the

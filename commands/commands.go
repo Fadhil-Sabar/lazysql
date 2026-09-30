@@ -24,6 +24,7 @@ const (
 	FocusSchemaPanel
 	FocusEditorPanel
 	FocusResultsPanel
+	FocusTransactionPanel
 	GrowPanel
 	ShrinkPanel
 	TogglePanel
@@ -81,6 +82,9 @@ const (
 	DuplicateRow
 	SortAsc
 	SortDesc
+	CommitTransaction
+	RollbackTransaction
+	ClearTransactionHistory
 	UnfocusTreeFilter
 	CommitTreeFilter
 	NextFoundNode
@@ -149,6 +153,8 @@ func (c Command) String() string {
 		return "FocusEditorPanel"
 	case FocusResultsPanel:
 		return "FocusResultsPanel"
+	case FocusTransactionPanel:
+		return "FocusTransactionPanel"
 	case GrowPanel:
 		return "GrowPanel"
 	case ShrinkPanel:
@@ -230,6 +236,12 @@ func (c Command) String() string {
 		return "SortAsc"
 	case SortDesc:
 		return "SortDesc"
+	case CommitTransaction:
+		return "CommitTransaction"
+	case RollbackTransaction:
+		return "RollbackTransaction"
+	case ClearTransactionHistory:
+		return "ClearTransactionHistory"
 	case NewConnection:
 		return "NewConnection"
 	case Connect:
