@@ -178,3 +178,57 @@ func TestSQLEditorVisualSelectionMultiLine(t *testing.T) {
 		t.Error("line1 cell 1 should not be selected")
 	}
 }
+
+func TestSQLEditorVisualLineUsesWholeLine(t *testing.T) {
+	line := "DELETE FROM reference.mst_activity_types WHERE value = '000020';"
+	e := NewSQLEditor("")
+	e.lines = []string{line}
+	e.selecting = true
+	e.vimMode = VimModeVisualLine
+	e.selCY, e.selCX = 0, 0
+	e.cy, e.cx = 0, 20 // cursor somewhere inside the line
+
+	if got := e.getSelectedText(); got != line {
+		t.Fatalf("getSelectedText = %q, want %q", got, line)
+	}
+
+	want := "DELETE FROM reference.mst_activity_types WHERE value = '000020'"
+	if got := e.QueryToExecute(); got != want {
+		t.Fatalf("QueryToExecute = %q, want %q", got, want)
+	}
+}
+
+func TestSQLEditorVisualLineMultiLineText(t *testing.T) {
+	e := NewSQLEditor("")
+	e.lines = []string{"a", "b", "c"}
+	e.selecting = true
+	e.vimMode = VimModeVisualLine
+	e.selCY, e.selCX = 0, 0
+	e.cy, e.cx = 2, 0
+
+	if got := e.getSelectedText(); got != "a\nb\nc" {
+		t.Fatalf("getSelectedText = %q, want %q", got, "a\nb\nc")
+	}
+}
+
+func TestSQLEditorVisualLineDeleteRemovesLines(t *testing.T) {
+	e := NewSQLEditor("")
+	e.lines = []string{"first", "second", "third"}
+	e.selecting = true
+	e.vimMode = VimModeVisualLine
+	e.selCY, e.selCX = 1, 0
+	e.cy, e.cx = 1, 2
+
+	e.pushUndo()
+	e.deleteSelection()
+
+	if len(e.lines) != 2 || e.lines[0] != "first" || e.lines[1] != "third" {
+		t.Fatalf("lines = %v, want [first third]", e.lines)
+	}
+	if e.cy != 1 || e.cx != 0 {
+		t.Fatalf("cursor = (%d,%d), want (1,0)", e.cy, e.cx)
+	}
+	if e.yankText != "second" {
+		t.Fatalf("yanked = %q, want %q", e.yankText, "second")
+	}
+}

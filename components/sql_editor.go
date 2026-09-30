@@ -1266,8 +1266,23 @@ func (e *SQLEditor) getSelectionRange() (startLine, startCol, endLine, endCol in
 	return e.cy, e.cx, e.selCY, e.selCX
 }
 
+// effectiveSelectionRange is the selection used by yank/delete/execute. In
+// visual-line mode it expands to whole lines, matching what Draw highlights;
+// the raw getSelectionRange is cursor-column based and would otherwise only
+// take a slice of the line.
+func (e *SQLEditor) effectiveSelectionRange() (startLine, startCol, endLine, endCol int) {
+	startLine, startCol, endLine, endCol = e.getSelectionRange()
+	if e.vimMode == VimModeVisualLine {
+		startCol = 0
+		if endLine >= 0 && endLine < len(e.lines) {
+			endCol = len(e.lines[endLine])
+		}
+	}
+	return startLine, startCol, endLine, endCol
+}
+
 func (e *SQLEditor) getSelectedText() string {
-	sl, sc, el, ec := e.getSelectionRange()
+	sl, sc, el, ec := e.effectiveSelectionRange()
 	// Selection is inclusive of the character under the cursor (vim behaviour).
 	if sl == el {
 		if sc >= len(e.lines[sl]) {
@@ -1296,8 +1311,21 @@ func (e *SQLEditor) yankSelection() {
 }
 
 func (e *SQLEditor) deleteSelection() {
-	sl, sc, el, ec := e.getSelectionRange()
 	e.setYankText(e.getSelectedText())
+
+	// Visual-line delete removes the whole lines, like vim's `V` + `d`.
+	if e.vimMode == VimModeVisualLine {
+		sl, _, el, _ := e.effectiveSelectionRange()
+		e.lines = append(e.lines[:sl], e.lines[el+1:]...)
+		if len(e.lines) == 0 {
+			e.lines = []string{""}
+		}
+		e.cy = min(sl, len(e.lines)-1)
+		e.cx = 0
+		return
+	}
+
+	sl, sc, el, ec := e.effectiveSelectionRange()
 
 	if sl == el {
 		end := min(ec+1, len(e.lines[sl]))

@@ -229,3 +229,15 @@ Keymap (`app/keymap.go`, `connection` group): `/` → `Search`, `s` →
   (this is what made the search field unresponsive after one keystroke). The
   event loop redraws automatically after each key, so no explicit draw is
   needed there.
+
+### Visual-line selection
+
+`V` (visual line) highlights whole lines, but yank / delete / execute used to
+take only the cursor-column slice of the line (`getSelectionRange`), so a cursor
+mid-line truncated the text — e.g. executing
+`DELETE ... WHERE value = '000020';` sent `... value = '000020` and Postgres
+rejected it with `pq: unterminated quoted string at or near "'"`. All of
+`getSelectedText`, `deleteSelection` and `QueryToExecute` now go through
+`effectiveSelectionRange`, which expands to whole lines in visual-line mode, and
+visual-line delete removes the lines entirely (vim `V` + `d`). Tests in
+`components/sql_editor_visual_test.go`.
