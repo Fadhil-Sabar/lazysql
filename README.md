@@ -1,999 +1,191 @@
 <a name="readme-top"></a>
 
-[![Contributors][contributors-shield]][contributors-url]
-[![Forks][forks-shield]][forks-url]
-[![Stargazers][stars-shield]][stars-url]
-[![Issues][issues-shield]][issues-url]
-[![MIT License][license-shield]][license-url]
-[![LinkedIn][linkedin-shield]][linkedin-url]
-
-<!-- PROJECT LOGO -->
 <div align="center">
-  <!-- <a href="https://github.com/jorgerojas26/lazysql"> -->
-  <!--   <img src="images/logo.png" alt="Logo" width="80" height="80"> -->
-  <!-- </a> -->
-
   <h3 align="center">LAZYSQL</h3>
-
   <p align="center">
-        A cross-platform TUI database management tool written in Go.
+    A cross-platform TUI database management tool written in Go.<br/>
+    <b>Fork of <a href="https://github.com/jorgerojas26/lazysql">jorgerojas26/lazysql</a>, based on v0.5.9.</b>
   </p>
 </div>
 
-<!-- TABLE OF CONTENTS -->
-<details>
-  <summary>Table of Contents</summary>
-  <ol>
-    <li>
-      <a href="#about-the-project">About The Project</a>
-      <ul>
-        <li><a href="#built-with">Built With</a></li>
-      </ul>
-    </li>
-    <li><a href="#features">Features</a></li>
-    <li>
-      <a href="#getting-started">Getting Started</a>
-      <ul>
-        <li><a href="#installation">Installation</a></li>
-      </ul>
-    </li>
-    <li><a href="#usage">Usage</a></li>
-    <li><a href="#manual-database-test-environment">Manual database test environment</a></li>
-    <li><a href="#result-and-network-semantics">Result and network semantics</a></li>
-    <li><a href="#commands">Commands</a></li>
-    <li><a href="#environment-variables">Environment variables</a></li>
-    <li><a href="#keybindings">Keybindings</a></li>
-    <li><a href="#roadmap">Roadmap</a></li>
-    <li><a href="#contributing">Contributing</a></li>
-    <li><a href="#license">License</a></li>
-    <li><a href="#contact">Contact</a></li>
-    <li><a href="#acknowledgments">Acknowledgments</a></li>
-  </ol>
-</details>
+> **What this fork adds:** a pure-Go **Oracle** driver, a much better **SQL editor**
+> (vim-style search, clipboard, DBeaver-style execution), **panel navigation and
+> resizing**, and a **sortable, searchable connection picker** with a DB-type
+> column. Everything else is upstream LazySQL.
+>
+> - Detailed fork notes: [`ORACLE_FORK.md`](ORACLE_FORK.md)
+> - Full upstream docs (config reference, themes, CLI/test tooling, all
+>   keybindings): [upstream README](https://github.com/jorgerojas26/lazysql#readme)
 
-<!-- ABOUT THE PROJECT -->
+---
 
-## About The Project
+## Enhancements
 
-![Product Name Screen Shot][product-screenshot1]
-![Product Name Screen Shot][product-screenshot2]
+### Oracle support
 
-This project is heavily inspired by [Lazygit](https://github.com/jesseduffield/lazygit), which I think is the best TUI client for Git.
+- New driver on pure-Go `github.com/sijms/go-ora/v2` (thin mode) — **no Oracle
+  Instant Client required**.
+- Use the `oracle` provider: `oracle://user:pass@host:1521/SERVICE`.
+- Oracle has no per-connection database, only schemas, so LazySQL lists
+  **schemas as the top-level nodes**. Leave `DBName` empty to list every schema
+  the user can access.
+- Not implemented yet in the Oracle driver: functions / procedures / views
+  listing and definitions (use DBeaver as a fallback for those).
 
-I wanted to have a tool like that, but for SQL. I didn't find one that fits my needs, so I created one myself.
+### SQL editor
 
-I live in the terminal, so if you are like me, this tool can become handy for you too.
+Vim-style **search** (also see the status bar for the match count):
 
-This is my first Open Source project, also, this is my first Go project. I am not a brilliant programmer. I am just a typical JavaScript developer that wanted to learn a new language, I also wanted a TUI SQL Client, so blanca y en botella, leche! (white and bottled).
+| Key | Action |
+| --- | --- |
+| `/` | forward search prompt |
+| `?` | backward search prompt |
+| `Ctrl+F` | search prompt (any mode) |
+| `n` / `N` | next / previous match |
+| `*` / `#` | next / previous match of the word under the cursor |
+| `Enter` | accept the pattern and keep matches highlighted |
+| `Esc` | cancel the prompt; on the buffer, clear the highlight |
 
-This project is in ALPHA stage, please feel free to complain about my spaghetti code.
+- Case-insensitive, live incremental (cursor jumps as you type), wraps around,
+  highlights every match.
 
-I use Lazysql daily in my full-time job as a full-stack javascript developer in its current (buggy xD) state. So, the plan is to improve and fix my little boy as a side-project in my free time.
+**Clipboard**
 
-### Built With
+- Bracketed paste works (terminal `Ctrl+Shift+V` / middle click), and `Ctrl+V`
+  reads the system clipboard. Multi-line SQL inserts at the cursor.
+- **Yanks copy to the system clipboard**: `y` (selection), `yy`, `dd`, and
+  deleting a selection. `p` / `P` paste.
 
-![Golang][golang-shield]
-![Golang][tview-shield]
+**Execution (DBeaver-style)**
 
-## Features
+`Ctrl+R` (or `Ctrl+E` while the editor has focus) runs **only what the cursor is
+on**, not the whole buffer:
 
-- [x] Cross-platform (macOS, Windows, Linux)
-- [x] Vim Keybindings
-- [x] Can manage multiple connections (Backspace)
-- [x] Tabs
-- [x] SQL Editor (CTRL + e)
+1. an active visual selection, otherwise
+2. the statement under the cursor — from the previous `;` to the next one, or to
+   the end of the buffer,
+3. with the trailing `;` stripped before it reaches the driver.
 
-<!-- GETTING STARTED -->
+Semicolons inside `'…'`, `"…"`, `` `…` ``, `--` comments and `/* … */` blocks are
+ignored. Visual mode selection is inclusive of the cursor character and supports
+the `w` / `b` / `e` word motions.
 
-## Getting Started
+### Panels
 
-### Installation
+Three focusable panels: **schema** (left), **SQL editor** (right, top) and
+**results** (right, bottom). Border titles show their focus digit (`[1] Databases`,
+`[2] Editor`, `[3] Results`).
 
-#### Homebrew (macOS/Linux)
+| Key | Action |
+| --- | --- |
+| `Ctrl+H` | focus schema panel |
+| `Ctrl+L` | return to the editor/results panel in use |
+| `Ctrl+K` / `Ctrl+J` | up: results → editor / down: editor → results |
+| `1` / `2` / `3` | focus schema / editor / results |
+| `+`, `=` / `-` | grow / shrink the focused panel |
+| `T` | collapse / expand the focused panel |
 
-```bash
-brew install lazysql
-```
+- Digits are ignored while typing (editor insert mode, filters, sidebar).
+- The results metadata menu moved from `1`–`5` to **`F1`–`F5`** to free the digits.
 
-#### Install with go package manager
+### Connection picker
 
-```bash
-go install github.com/jorgerojas26/lazysql@latest
-```
+- **Sorted by name ascending** (case-insensitive); `s` toggles ascending/descending.
+- **Type column** showing `PostgreSQL`, `Oracle`, `MySQL`, `SQLite`, `SQL Server`, `ClickHouse`.
+- **`/` filter** below the buttons: live filter on name, type or URL.
+  `Enter`/`Esc` in the field returns to the list **keeping** the filter; `Esc` on
+  the list clears it.
+- Edit/delete follow the selected connection even after sorting/filtering.
 
-#### Binary Releases
+---
 
-For Windows, macOS or Linux, you can download a binary release [here](https://github.com/jorgerojas26/lazysql/releases)
+## Install
 
-#### Third party (maintained by the community)
-
-Arch Linux users can install it from the AUR with:
-
-```bash
-paru -S lazysql
-
-```
-
-or
-
-```bash
-yay -S lazysql
-
-```
-
-or install it manual with:
+Requires **Go 1.23+**. The module path is still upstream's, so build from source:
 
 ```bash
-git clone https://aur.archlinux.org/lazysql.git
+git clone https://github.com/Fadhil-Sabar/lazysql.git
 cd lazysql
-makepkg -si
+go build -o lazysql .
+# or: go install .
 ```
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
+Install to your `PATH`:
 
-<!-- USAGE EXAMPLES -->
+```bash
+install -m755 lazysql ~/go/bin/lazysql
+```
 
 ## Configuration
 
-If the `XDG_CONFIG_HOME` environment variable is set, the configuration file will be located at:
-
-- `${XDG_CONFIG_HOME}/lazysql/config.toml`
-
-If not, the configuration file will be located at:
-
-- Windows: `%APPDATA%\lazysql\config.toml`
-- macOS: `~/Library/Application Support/lazysql/config.toml`
-- Linux: `~/.config/lazysql/config.toml`
-
-The configuration file is a TOML file and can be used to define multiple connections.
-
-### Example configuration
+Config lives at `${XDG_CONFIG_HOME}/lazysql/config.toml`, or
+`~/.config/lazysql/config.toml` on Linux, `~/Library/Application Support/lazysql/config.toml`
+on macOS and `%APPDATA%\lazysql\config.toml` on Windows.
 
 ```toml
 [[database]]
-Name = 'Production database'
-Provider = 'postgres'
-DBName = 'foo'
-URL = 'postgres://${user}:urlencodedpassword@localhost:${port}/foo'
-ReadOnly = true
-Commands = [
-  { Command = 'ssh -tt remote-bastion -L ${port}:localhost:5432', WaitForPort = '${port}' },
-  { Command = 'whoami', SaveOutputTo = 'user' },
-]
+Name = 'Prod (Oracle)'
+Provider = 'oracle'
+URL = 'oracle://user:password@host:1521/SERVICE'
+
 [[database]]
-Name = 'Development database'
+Name = 'Dev (Postgres)'
 Provider = 'postgres'
-DBName = 'foo'
-URL = 'postgres://postgres:urlencodedpassword@localhost:5432/foo'
+DBName = 'app'            # omit to list every database in the instance
+URL = 'postgres://${env:DB_USER}:${env:DB_PASSWORD}@localhost:5432/app?sslmode=disable'
+ReadOnly = true
+
 [application]
 DefaultPageSize = 300
 DisableSidebar = false
 SidebarOverlay = false
-JSONViewerWordWrap = false
-EnterOpensJSONViewer = false
-schema_bulk_load_threshold = 200
-exact_count_threshold = 50000
-exact_count_timeout_ms = 200
 max_query_rows = 1000
-max_open_connections = 8
-max_idle_connections = 8
-```
 
-The `ReadOnly` field (optional, defaults to `false`) can be set to `true` to enable read-only mode for a connection. When enabled, all mutation queries (INSERT, UPDATE, DELETE, DROP, etc.) will be blocked.
-
-Database entries may override the connection pool with `max_open_connections` and `max_idle_connections`. Omitted values inherit the application settings; an explicit `0` uses LazySQL's default of `8`. Invalid combinations (for example, idle connections greater than open connections) are rejected. SQLite always uses one open and one idle connection (`1/1`) to preserve in-memory database behavior, ignoring the general pool settings.
-
-The `DBName` field (optional) controls how the sidebar tree is populated when a connection is opened:
-
-- **`DBName` set** (e.g. `DBName = 'foo'`): the tree is pinned to that single database only. This is the default behavior when a connection is created/edited through the in-app connection form, since `DBName` is auto-filled from whatever database is embedded in the connection URL.
-- **`DBName` empty or omitted**: the tree lists *every* database in the instance that the connecting user has `CONNECT` privileges on (via `GetDatabases()`), not just the one in the URL. This is useful when you regularly need to browse or query across multiple databases/catalogs on the same PostgreSQL or MSSQL server — PostgreSQL in particular requires a database to be specified in the connection string even though the same login is often valid for several databases on that instance.
-
-To enable multi-database browsing for a connection, either:
-
-- Remove/comment out the `DBName` line for that connection directly in `config.toml`, **or**
-- Check **"Show all databases in this instance"** when adding or editing the connection through the in-app connection form (`a` to add, `e` to edit from the connection picker). This overrides the auto-filled `DBName` and saves the connection with it left empty, without you needing to hand-edit the TOML file. When re-opening an existing connection for editing, the checkbox is automatically pre-checked if it was previously saved this way.
-
-Note: this setting only affects which databases populate the sidebar tree. It does not change which database the initial connection is authenticated against — that is still determined entirely by the database in the connection URL (a requirement of the PostgreSQL and MSSQL wire protocols).
-
-The `[application]` section is used to define some app settings. Not all settings are available yet, this is a work in progress.
-
-### Application settings
-
-| Setting | Default | Description |
-| ------- | ------- | ----------- |
-| DefaultPageSize | 300 | Number of records to fetch per page |
-| DisableSidebar | false | Disable the sidebar |
-| SidebarOverlay | false | Show sidebar as overlay instead of side panel |
-| JSONViewerWordWrap | false | Enable word wrap in JSON viewer |
-| EnterOpensJSONViewer | false | Open JSON viewer when pressing Enter on a cell |
-| exact_count_threshold | 50000 | Automatically run an exact count when an unfiltered estimate is at or below this value (0 = never auto-count an estimate) |
-| exact_count_timeout_ms | 200 | Budget for automatic exact counts in milliseconds (0 = disable automatic exact counts; manual `#` remains available) |
-| max_query_rows | 1000 | Maximum rows shown by an interactive SQL-editor result (0 = unlimited) |
-| schema_bulk_load_threshold | 200 | Maximum visible tables whose columns are eagerly loaded in bulk (0 = always lazy) |
-| max_open_connections | 8 | Maximum open connections for MySQL, PostgreSQL, and MSSQL (0 = use default 8) |
-| max_idle_connections | 8 | Maximum idle connections for MySQL, PostgreSQL, and MSSQL (0 = use default 8) |
-
-`schema_bulk_load_threshold` limits eager autocomplete column loading to small
-visible schemas. `0` keeps all columns lazy; larger schemas still expose table
-names immediately and fetch a requested table on demand. Cached or in-flight
-columns are reused regardless of the threshold.
-
-### Themes
-
-Colors are set in the `[theme]` section. Pick a preset and, optionally, override single colors on top of it:
-
-```toml
 [theme]
-Preset = "light"
-
-[theme.Colors]
-Border = "#666A7E"
-Title = "black"
-PrimaryText = "default"
-EditorStatusBarBackground = "lightgray"
-SQLKeyword = "#005F87"
+Preset = "dracula"
 ```
 
-Presets:
-
-| Preset | Description |
-| ------ | ----------- |
-| `default` | The standard lazysql colors, on the terminal's background |
-| `light` | GitHub-inspired light palette with a painted background |
-| `dracula` | [Dracula](https://draculatheme.com) |
-| `gruvbox-dark` | [Gruvbox](https://github.com/morhetz/gruvbox) dark |
-| `nord` | [Nord](https://www.nordtheme.com) |
-| `solarized-light` | [Solarized](https://ethanschoonover.com/solarized/) light |
-| `tokyo-night` | [Tokyo Night](https://github.com/enkia/tokyo-night-vscode-theme) |
-| `catppuccin-mocha` | [Catppuccin](https://github.com/catppuccin/catppuccin) Mocha |
-
-Press `Ctrl+T` anywhere in lazysql to open the theme picker. Move with the arrow keys, `j`/`k`, or `Ctrl+N`/`Ctrl+P` to preview each theme across the running application. Press `Enter` to apply and save the selected preset, or `q`/`Esc` to restore the previous theme.
-
-`default` uses the terminal's background color. All other presets paint their own background.
-
-A color is a name (`"red"`, `"dodgerblue"`, any [W3C color name](https://github.com/gdamore/tcell/blob/v2.7.4/color.go#L851)), a hex value (`"#RRGGBB"`), or `"default"` for the terminal's own color. Unknown keys, presets and colors are reported when lazysql starts.
-
-Keys for `[theme.Colors]`:
-
-| Key | Used for |
-| --- | -------- |
-| `PrimitiveBackground` | Background of all views |
-| `ContrastBackground`, `MoreContrastBackground` | Backgrounds of input fields, buttons and drop-downs |
-| `Border`, `Title`, `Graphics` | Default border, title and line colors |
-| `PrimaryText` | Main text |
-| `SecondaryText` | Highlights: selected rows, active tab, key hints, sidebar values |
-| `TertiaryText` | Labels and status messages |
-| `InverseText` | Borders and text of unfocused views, form fields |
-| `ContrastSecondaryText` | Text drawn on `SecondaryText` (selected rows, active tab) |
-| `SidebarTitleBorder` | Separator next to the sidebar field names |
-| `Error` | Error messages |
-| `ReadOnly` | Read-only markers |
-| `TableChange`, `TableInsert`, `TableDelete`, `TableMarked` | Backgrounds of changed, inserted, deleted and marked rows |
-| `EditorSelection` | Selected text in the SQL editor |
-| `EditorStatusBarBackground`, `EditorStatusBarText` | SQL editor status bar |
-| `AutocompleteBackground`, `AutocompleteText`, `AutocompleteSelected`, `AutocompleteDescription`, `AutocompleteSeparator` | SQL editor autocomplete popup |
-| `SQLKeyword`, `SQLString`, `SQLNumber`, `SQLComment`, `SQLFunction`, `SQLOperator`, `SQLType`, `SQLBoolean`, `SQLParameter` | SQL syntax highlighting |
-| `JSONKey`, `JSONString`, `JSONBoolean`, `JSONNull`, `JSONNumber` | JSON viewer |
-
-### Local Configuration
-
-You can place a `.lazysql.toml` file in your project directory (next to your `.git` folder) to override the global configuration for that project. This is useful for defining project-specific database connections or settings.
-
-lazysql searches for `.lazysql.toml` by walking up from the current working directory. It stops at the git repository root (where `.git` is found). If no local config is found, the global configuration is used as-is.
-
-**Merge behavior:**
-
-| Section | Behavior |
-| ------- | -------- |
-| `[application]` | Deep merge — local values override global, unset fields keep global/defaults |
-| `[[database]]` | Replace — local connections completely replace global connections |
-| `[keymap.*]` | Deep merge — local keybindings override global ones for the same command |
-| `[theme]` | Deep merge — a local `Preset` or color overrides the global one, other colors are kept |
-
-**Example `.lazysql.toml`:**
-
-```toml
-[application]
-DefaultPageSize = 500
-
-[[database]]
-Name = 'Local development'
-Provider = 'postgres'
-URL = 'postgres://localhost/myproject_dev'
-```
-
-With this local config, `DefaultPageSize` overrides the global value, and only the `Local development` connection is available (global connections are replaced).
-
-Environment variables (`${env:VAR_NAME}`) work in local config files just like in the global config.
-
-Note: When a local `.lazysql.toml` is found, the full config is saved to the local file when you modify connections from the UI.
-
-### Manual database test environment
-
-This repository includes a plug-and-play, development-only fixtures for
-MySQL, PostgreSQL, MSSQL,
-and SQLite. The fixture is intended for manual testing of records, pagination,
-filtering, sorting, metadata, Foreign Key Jump, SQL editor results, and CSV
-exports.
-
-Prerequisites are Docker, Docker Compose v2, and OpenSSL. The stack does not require any
-host-installed database client.
-
-From the repository root:
-
-```bash
-./scripts/manual-databases.sh validate
-./scripts/manual-databases.sh init
-./scripts/manual-databases.sh up
-lazysql
-```
-
-`init` generates a random password and private, git-ignored `.env.manual-databases`
-and `.lazysql.toml` files. It refuses to overwrite existing local configuration.
-Ports bind only to `127.0.0.1`. Do not reuse these development credentials elsewhere.
-If upgrading from the old fixed-password fixtures, run `reset` after `init` to
-recreate the volumes with the new password (this deletes all fixture data).
-
-When LazySQL is started from the repository root, the generated `.lazysql.toml`
-is discovered automatically and contains four ready-to-use connections:
-
-| Connection | Provider | Host port | Fixture database |
-| ---------- | -------- | --------- | ---------------- |
-| Docker MySQL | `mysql` | `3307` | `lazysql_test` |
-| Docker PostgreSQL | `postgres` | `5433` | `lazysql_test` |
-| Docker MSSQL | `sqlserver` | `14331` | `lazysql_test` |
-| Docker SQLite | `sqlite3` | file | `testdata/sqlite/lazysql.sqlite3` |
-
-Use the helper script for the lifecycle:
-
-```bash
-./scripts/manual-databases.sh status  # health and seed status
-./scripts/manual-databases.sh down    # stop, preserve data
-./scripts/manual-databases.sh reset   # destroy and reseed everything
-```
-
-`up` builds the small SQLite helper image, initializes the server fixtures, and
-waits until all databases contain their seed tables. MySQL and PostgreSQL use
-their official image initialization hooks and named volumes; those scripts run
-when the volume is empty. MSSQL seeds through a second container and keeps a
-seed marker so restarting the stack does not overwrite manual changes. SQLite
-is a local file seeded by the helper container and is safe to initialize more
-than once. Use `reset` when a clean fixture is needed.
-
-The fixture uses 1,200 customers, 300 products, 3,000 orders, 9,000 order
-items, and 2,400 customer notes. It includes primary/foreign keys, unique
-constraints, indexes, nullable columns, dates, numeric and boolean values,
-JSON/text values, a view, and provider-specific catalog objects. See
-[`testdata/README.md`](testdata/README.md) for the model and
-[`docker-compose.yml`](docker-compose.yml) for ports and credentials.
-
-The MSSQL image is x86-64-only and the service is explicitly run as
-`linux/amd64`. Docker may emulate it on Apple Silicon; Microsoft does not
-support that emulation path, so use a native x86 host or a remote SQL Server if
-it fails. If a host port is already in use, change the port in both
-`docker-compose.yml` and `.lazysql.toml` before starting the stack. The SQLite
-URL is relative to the process working directory, so launch LazySQL from the
-repository root for that connection.
-
-
-## Usage
-
-> For a list of keyboard shortcuts press `?`
-
-Open the TUI with:
-```console
-$ lazysql
-```
-
-To launch lazysql with the ability to pick from the saved connections.
-```console
-$ lazysql [connection_url]
-```
-
-To launch lazysql and connect to database at [connection_url].
-
-```console
-$ lazysql --read-only [connection_url]
-```
-
-To launch lazysql in read-only mode.
-
-### Connect to a DB
-
-1. Start `lazysql`
-2. Create a new connection (press `n`)
-3. Provide a name for the connection as well as the URL to connect to (see <a href="#example-connection-urls">example connection URL</a>)
-4. Connect to the DB (press `<Enter>`)
-
-If you already have a connection set up:
-1. Start `lazysql`
-2. Select the right connection (press `j` and `h` for navigation)
-3. Connect to the DB (press `c` or `<Enter>`)
-
-### Create a table
-
-There is currently no way to create a table from the TUI.
-However you can run the query to create the table as a SQL-Query,
-inside the <a href="#execute-sql-queries">SQL Editor</a>.
-
-You can update the tree by pressing `R`, so you can see your newly created table.
-
-### Execute SQL queries
-
-1. Press `<Ctrl+E>` to open the built-in SQL Editor
-2. Write the SQL query
-3. Press `<Ctrl+R>` to execute the SQL query
-
-> To switch back to the table-tree press `H`
->
-> After executing a `SELECT`-query a table will be displayed under the SQL-Editor
-> with the query-result. \
-> To switch focus back to SQL-Editor press `/`
-
-### Result and network semantics
-
-Records pages are fetched with one page of rows plus a lookahead row. The
-lookahead makes navigation work without an exact count, so the pagination label
-has three intentional forms:
-
-- `843 rows` / `1-843 of 843 rows`: **exact**; the database count or an
-  end-of-page inference proved the total.
-- `~4.3M rows`: **estimated**; the database supplied a useful estimate, but it
-  is not a guarantee.
-- `300+ rows`: **unknown-more**; the current page has more rows available and
-  no exact total is known yet.
-
-#### Exact Records count
-
-Press `#` (`ExactCount`) in the Records surface to start an exact count. Press
-`#` again while it is running to cancel it; a failed count stays local to the
-pagination bar and can be retried with `#`. Automatic counting never blocks the
-first Records page: LazySQL first uses a driver estimate where available and
-runs an exact count only when the estimate is at or below
-`exact_count_threshold` (default `50000`), or when an estimate is unavailable.
-A threshold of `0` disables estimate-driven automatic exact counts; filtered
-counts and unavailable estimates still obey the timeout. The automatic count is
-bounded by `exact_count_timeout_ms` (default `200`). Set
-that timeout to `0` to disable automatic exact counts; estimates still render
-and a manual `#` count remains available. Filtered Records counts are also
-bounded by the automatic timeout.
-
-#### SQL results and cancellation
-
-Interactive SQL results stream progressively and default to
-`max_query_rows = 1000`. A positive cap renders at most that many rows and
-performs one lookahead read so the UI can say `result truncated`; `0` means
-unlimited. The cap applies only to interactive results, not full exports.
-While a SQL-editor result query is active, press `Esc` to cancel its context and
-keep any partial rows already rendered. When no result query is active, `Esc`
-keeps the editor's normal unfocus/editing behavior.
-
-#### CSV export
-
-- **Export Visible Results** writes the rows already shown and never
-  reexecutes the SQL statement.
-- **Export All Results** streams the complete table/query result independently
-  of `max_query_rows`. For SQL results it reexecutes only a conservative,
-  replay-safe read-only statement; mutating or unknown statements offer the
-  visible-results option only.
-
-Both scopes write through a temporary file. Cancellation, query failure, or a
-write/rename failure removes the temporary file and leaves an existing
-destination unchanged.
-
-#### Performance diagnostics
-
-For local JSONL timings, start LazySQL with `--loglevel debug --logfile /path/to/lazysql.jsonl`. Logs include operation duration, database identity,
-cache/fallback outcome, cancellation/failure, and
-`event=first_useful_result` for Records and SQL-editor results. SQL text,
-arguments, row values, credentials, and connection URLs are redacted; no
-telemetry is sent.
-
-For the implementation matrix and the no-credentials RTT benchmark harness,
-see [`docs/performance.md`](docs/performance.md).
-
-### Open/view a table
-
-1. Expand the table-tree by pressing `e` or `<Enter>`
-2. Select the table you want to view
-    - next node `j`
-    - previous node `k`
-    - last node `G`
-    - first node `g`
-3. Press `<Enter>` to open the table
-
-> To switch back to the table-tree press `H` \
-> To switch back to the table press `L`
-
-### Filter rows
-
-1. [Open a table](#openview-a-table)
-2. Press `/` to focus the filter input
-3. Write a `WHERE`-clause to filter the table
-4. Press `<Enter>` to submit your filter
-
-> To remove the filter, focus the filter input (press `/`) and press `<Esc>`.
-
-### Jump to a referenced row (Foreign Key Jump)
-
-Columns that belong to a foreign key are underlined in the header, and the
-values you can follow are underlined too. Cells with pending changes (inserted,
-edited or deleted rows) are not marked.
-
-1. [Open a table](#openview-a-table)
-2. Press `1` to switch to the record tab
-3. Move to the underlined foreign key cell you want to follow
-4. Press `<Enter>` to jump to the referenced row
-
-The referenced table opens in a new tab (or is focused, if it is already open)
-with a filter prefilled for the referenced value, so only the matching rows are
-shown: `WHERE <referenced_column> = '<value>'`.
-
-> To switch tabs press `[` or `]`, to switch back to the table-tree press `H`.
-
-Notes:
-
-- Only single-column foreign keys can be followed. Composite foreign keys
-  (constraints spanning multiple columns) are ignored.
-- Cells whose value is `NULL`, `EMPTY` or `DEFAULT` have nothing to follow, so
-  `<Enter>` does nothing on them.
-- Supported providers: PostgreSQL, SQLite and SQL Server (MSSQL). MySQL tables
-  do not expose the foreign key information needed for the jump.
-- On a cell that supports a Foreign Key Jump, `<Enter>` follows the relation
-  instead of opening the JSON viewer, even when `EnterOpensJSONViewer` is enabled.
-
-### Insert a row
-
-1. [Open a table](#openview-a-table)
-2. Press `1` to switch to the record tab
-3. Press `o` to insert a new row
-4. Fill out all columns
-5. Press `<Ctrl+S>` to save the changes
-
-### Edit a column
-
-1. [Open a table](#openview-a-table)
-2. Press `1` to switch to the record tab
-3. Move to the cell you want to edit
-4. Edit the value:
-    - press `c` to edit it inline, then press `<Enter>` to submit
-    - press `e` to edit it in your editor, then save and quit the editor
-5. Press `<Ctrl+S>` to save the changes
-
-### Copy rows
-
-1. [Open a table](#openview-a-table)
-2. Move to a row and press `<Space>` to mark it. Repeat to mark as many rows as you want (press `<Space>` again to unmark)
-3. Press `y` to copy every marked row to the clipboard as tab separated values, one row per line
-
-> With no rows marked, `y` keeps its original behavior and copies the value of the selected cell.
-
-### Export to CSV
-
-#### From Table View
-
-1. [Open a table](#openview-a-table)
-2. Apply filters or sorting as needed
-3. Press `E` to open the export dialog
-4. Optionally modify the file path and batch size
-5. Select export scope:
-   - Export Current Page: Export only the currently displayed rows
-   - Export All Records: Fetch and export all records from the table
-
-> Batch size (default: 10000): When exporting all records, data is fetched in batches to avoid timeout or memory issues with large tables. Increase for faster exports, decrease if you encounter any errors.
->
-> The default file path is `~/Downloads/{database}_{table}_{timestamp}.csv`.
-
-#### From SQL Editor
-
-1. [Execute a SQL query](#execute-sql-queries)
-2. Press `E` to open the export dialog
-3. Optionally modify the file path
-4. Select **Export Visible Results** to save the rows currently shown
-5. For replay-safe/read-only statements, select **Export All Results** to reexecute the query and stream every row
-
-> Export All Results may reexecute the query and may take significant time. Unknown or potentially mutating statements offer visible-results export only. Press `Esc` during an export to cancel it; a cancelled or failed export leaves the requested destination unchanged.
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-## Support
-
-- [x] MySQL
-- [x] PostgreSQL
-- [x] SQLite
-- [x] MSSQL
-- [x] ClickHouse
-- [ ] MongoDB
-
-Support for multiple RDBMS is a work in progress.
-
-<!-- COMMANDS -->
-
-## Commands
-
-In some cases, mostly when connecting to remote databases, it might be necessary to run a custom command
-before being able to connect to the database. For example when you can only access the database through
-a remote bastion, you would probably first need to open an SSH tunnel by running the following command
-in a separate terminal:
-
-```bash
-ssh remote-bastion -L 5432:localhost:5432
-```
-
-In order to make it easier to run these commands, lazysql supports running custom commands before connecting
-to the database. You can define these commands in the configuration file like this:
-
-```toml
-[[database]]
-Name = 'server'
-Provider = 'postgres'
-DBName = 'foo'
-URL = 'postgres://${user}:password@localhost:${port}/foo'
-Commands = [
-  { Command = 'ssh -tt remote-bastion -L ${port}:localhost:5432', WaitForPort = '${port}' },
-  { Command = 'whoami', SaveOutputTo = 'user' },
-]
-```
-
-The `Command` field is required and can contain any command that you would normally run in your terminal.
-The `WaitForPort` field is optional and can be used to wait for a specific port to be open before continuing.
-The `SaveOutputTo` field is optional and can be used to make user-defined variables. The output (`stdout`) from the command will be saved into the variable, and the variable can be used in the URL or future commands via the `${VARIABLE}` syntax.
-
-When you define the `${port}` variable in the URL field, lazysql will automatically replace it with a random
-free port number. This port number will then be used in the connection URL and is available in the `Commands`
-field so that you can use it to configure the command.
-
-You can even chain commands to, for example, connect to a remote server and then to a postgres container
-running in a remote k8s cluster:
-
-```toml
-[[database]]
-Name = 'container'
-Provider = 'postgres'
-DBName = 'foo'
-URL = 'postgres://postgres:password@localhost:${port}/foo'
-Commands = [
-  { Command = 'ssh -tt remote-bastion -L 6443:localhost:6443', WaitForPort = '6443' },
-  { Command = 'kubectl port-forward service/postgres ${port}:5432 --kubeconfig /path/to/kube.conf', WaitForPort = '${port}' }
-]
-```
-
-## Environment variables
-
-You can use environment variables in the configuration file using the `${env:VAR_NAME}` syntax. This is useful for keeping sensitive information like passwords out of the configuration file.
-
-```toml
-[[database]]
-Name = 'Production'
-Provider = 'postgres'
-URL = 'postgres://${env:DB_USER}:${env:DB_PASSWORD}@localhost:5432/mydb'
-```
-
-```bash
-export DB_USER=admin
-export DB_PASSWORD=secret
-lazysql
-```
-
-Note: Undefined environment variables will be replaced with an empty string.
-
-<!-- KEYBINDINGS -->
-
-## Keybindings
-
-### Custom Keybindings
-
-You can customize keybindings by adding a `[keymap.<Group>]` section to your `config.toml` file. Each entry maps a command name to a key.
+- `${env:VAR}` expands environment variables (keep passwords out of the file).
+- `Commands = [{ Command = 'ssh -tt bastion -L ${port}:localhost:5432', WaitForPort = '${port}' }]`
+  runs a command before connecting (bastion / tunnel / port-forward).
+- Keybindings are remappable per group, e.g.:
 
 ```toml
 [keymap.Home]
-SwitchToEditorView = "i"
-Quit = "Esc"
-
-[keymap.Tree]
-GotoTop = "t"
-Search = "Ctrl-F"
-
+ToggleQueryHistory = "F2"
 ```
 
-For single character keys, use the character directly (e.g., `"q"`, `"G"`, `"1"`, `"/"`). For special keys, use the [tcell key name](https://github.com/gdamore/tcell/blob/v2.7.4/key.go#L83) (e.g., `"Enter"`, `"Esc"`, `"Ctrl-S"`). Only key names defined in tcell are supported.
+See the [upstream README](https://github.com/jorgerojas26/lazysql#readme) for the
+full configuration reference, themes, and the manual DB test environment.
 
-Group names are case-insensitive (`Home`, `home`, and `HOME` all work).
+## Keybindings (quick reference)
 
-Available groups: `Home`, `Connection`, `Tree`, `TreeFilter`, `Table`, `Editor`, `Sidebar`, `QueryPreview`, `QueryHistory`, `JSONViewer`.
+| Context | Keys |
+| --- | --- |
+| Connection picker | `/` filter · `s` sort · `c`/`Enter` connect · `n` new · `e` edit · `d` delete · `q` quit |
+| Panels | `Ctrl+H/J/K/L` navigate · `1/2/3` focus · `+`/`-` resize · `T` collapse |
+| Editor | `/` `?` `Ctrl+F` search · `n`/`N` `*`/`#` matches · `Ctrl+R`/`Ctrl+E` run · `Ctrl+V` paste · `Ctrl+Space` external editor |
+| Home | `Ctrl+E` editor · `Ctrl+S` run pending changes · `Ctrl+P` global search · `Ctrl+_` query history · `Backspace` connections · `?` help · `q` quit |
 
-### Default Keybindings
+Full tables (Home, Tree, Table, Sidebar, JSON viewer, …) are in the
+[upstream README](https://github.com/jorgerojas26/lazysql#readme).
 
-#### Home
+## Clipboard
 
-| Default Key | Command | Description |
-| --- | --- | --- |
-| L | MoveRight | Focus table |
-| H | MoveLeft | Focus tree |
-| Ctrl-E | SwitchToEditorView | Open SQL editor |
-| Ctrl-S | Save | Execute pending changes |
-| q | Quit | Quit |
-| Backspace | SwitchToConnectionsView | Switch to connections list |
-| ? | HelpPopup | Help |
-| Ctrl-P | SearchGlobal | Global search |
-| Ctrl-_ | ToggleQueryHistory | Toggle query history modal |
-| T | ToggleTree | Toggle file tree |
+Uses [`atotto/clipboard`](https://github.com/atotto/clipboard). On Linux, install
+`xclip` or `xsel` (Wayland: `wl-clipboard`).
 
-#### Connection
+## Database support
 
-| Default Key | Command | Description |
-| --- | --- | --- |
-| n | NewConnection | Create a new database connection |
-| c | Connect | Connect to database |
-| Enter | Connect | Connect to database |
-| e | EditConnection | Edit a database connection |
-| d | DeleteConnection | Delete a database connection |
-| q | Quit | Quit |
-
-#### Tree
-
-| Default Key | Command | Description |
-| --- | --- | --- |
-| g | GotoTop | Go to top |
-| G | GotoBottom | Go to bottom |
-| Enter | Execute | Open |
-| j | MoveDown | Go down |
-| Down | MoveDown | Go down |
-| Ctrl-U | PagePrev | Go page up |
-| Ctrl-D | PageNext | Go page down |
-| k | MoveUp | Go up |
-| Up | MoveUp | Go up |
-| / | Search | Search |
-| n | NextFoundNode | Go to next found node |
-| N | PreviousFoundNode | Go to previous found node |
-| p | PreviousFoundNode | Go to previous found node |
-| P | NextFoundNode | Go to next found node |
-| c | TreeCollapseAll | Collapse all |
-| e | ExpandAll | Expand all |
-| R | Refresh | Refresh tree |
-
-#### Tree Filter
-
-| Default Key | Command | Description |
-| --- | --- | --- |
-| Esc | UnfocusTreeFilter | Unfocus tree filter |
-| Enter | CommitTreeFilter | Commit tree filter search |
-
-#### Table
-
-| Default Key | Command | Description |
-| --- | --- | --- |
-| / | Search | Search |
-| c | Edit | Change cell |
-| d | Delete | Delete row |
-| w | GotoNext | Go to next cell |
-| b | GotoPrev | Go to previous cell |
-| $ | GotoEnd | Go to last cell |
-| 0 | GotoStart | Go to first cell |
-| Enter | ForeignKeyJump | Jump to the referenced row from a foreign key cell (see [Foreign Key Jump](#jump-to-a-referenced-row-foreign-key-jump)) |
-| y | Copy | Copy cell value to clipboard (or marked rows if any) |
-| Space | RowSelect | Toggle row selection |
-| o | AppendNewRow | Append new row |
-| O | DuplicateRow | Duplicate row |
-| J | SortDesc | Sort descending |
-| R | Refresh | Refresh the current table |
-| # | ExactCount | Calculate or cancel the exact Records count |
-| K | SortAsc | Sort ascending |
-| C | SetValue | Toggle value menu (NULL, EMPTY, DEFAULT) |
-| [ | TabPrev | Switch to previous tab |
-| ] | TabNext | Switch to next tab |
-| { | TabFirst | Switch to first tab |
-| } | TabLast | Switch to last tab |
-| X | TabClose | Close tab |
-| > | PageNext | Switch to next page |
-| < | PagePrev | Switch to previous page |
-| 1 | RecordsMenu | Switch to records menu |
-| 2 | ColumnsMenu | Switch to columns menu |
-| 3 | ConstraintsMenu | Switch to constraints menu |
-| 4 | ForeignKeysMenu | Switch to foreign keys menu |
-| 5 | IndexesMenu | Switch to indexes menu |
-| S | ToggleSidebar | Toggle sidebar |
-| s | FocusSidebar | Focus sidebar |
-| Z | ShowRowJSONViewer | Toggle JSON viewer for row |
-| z | ShowCellJSONViewer | Toggle JSON viewer for cell |
-| f | ReverseForeignKeyJump | Pick a table referencing the current row and open it filtered |
-| E | ExportCSV | Export to CSV |
-| e | OpenCellInExternalEditor | Edit cell in external editor |
-
-> `Enter` (`ForeignKeyJump`) only applies on the record tab (`1`) of a table view. It is part of the `Table` group, so it can be remapped like any other keybinding: `[keymap.Table] ForeignKeyJump = "Ctrl-G"`.
-
-#### Editor
-
-| Default Key | Command | Description |
-| --- | --- | --- |
-| Ctrl-R | Execute | Execute query |
-| Esc | CancelQuery | Cancel the active query; otherwise preserve normal editor Escape behavior |
-| Ctrl-Space | OpenInExternalEditor | Open in external editor |
-
-Specific editor for lazysql can be set by `$SQL_EDITOR`.
-
-### JSON Viewer
-
-| Key | Action           |
-| --- | ---------------- |
-| w   | Toggle word wrap |
-| y   | Copy to clipboard|
-| z/Z | Close viewer     |
-
-The JSON viewer can be opened by pressing `z` (cell) or `Z` (row) on a table cell. If `EnterOpensJSONViewer` is enabled, pressing Enter on a cell will also open the JSON viewer, unless the cell supports a [Foreign Key Jump](#jump-to-a-referenced-row-foreign-key-jump) (which takes precedence).
-
-
-#### Sidebar
-
-| Default Key | Command | Description |
-| --- | --- | --- |
-| s | UnfocusSidebar | Focus table |
-| S | ToggleSidebar | Toggle sidebar |
-| j | MoveDown | Focus next field |
-| k | MoveUp | Focus previous field |
-| g | GotoStart | Focus first field |
-| G | GotoEnd | Focus last field |
-| c | Edit | Edit field |
-| Enter | CommitEdit | Add edit to pending changes |
-| Esc | DiscardEdit | Discard edit |
-| C | SetValue | Toggle value menu (NULL, EMPTY, DEFAULT) |
-| y | Copy | Copy value to clipboard |
-
-#### Query Preview
-
-| Default Key | Command | Description |
-| --- | --- | --- |
-| Ctrl-S | Save | Execute queries |
-| q | Quit | Quit |
-| y | Copy | Copy query to clipboard |
-| d | Delete | Delete query |
-
-#### Query History
-
-| Default Key | Command | Description |
-| --- | --- | --- |
-| s | Save | Save query |
-| d | Delete | Delete query |
-| q | Quit | Quit |
-| y | Copy | Copy query to clipboard |
-| / | Search | Search |
-| Ctrl-_ | ToggleQueryHistory | Toggle query history modal |
-| [ | TabPrev | Switch to previous tab |
-| ] | TabNext | Switch to next tab |
-
-#### JSON Viewer
-
-| Default Key | Command | Description |
-| --- | --- | --- |
-| Z | ShowRowJSONViewer | Toggle JSON viewer |
-| z | ShowCellJSONViewer | Toggle JSON viewer |
-| y | Copy | Copy value to clipboard |
-| w | ToggleJSONViewerWrap | Toggle word wrap |
-
-### External Editor
-
-The external editor feature (CTRL + Space in SQL Editor, `e` in Table) uses the following environment variables to determine which editor to use:
-
-- SQL Editor: `$SQL_EDITOR` > `$EDITOR` > `$VISUAL` > `vi`
-- Table cells: `$EDITOR` > `$VISUAL` > `vi`
-
-Editor commands with flags are supported, e.g. `EDITOR="vim -u NONE"`. GUI editors
-should use the flag that blocks until the file is closed (such as `--wait` for VS
-Code or `-w` for Sublime Text), otherwise lazysql reads the file back before you
-finish editing.
-
-This feature is only available on Linux and macOS.
-
-
-## Example connection URLs
-
-```
-postgres://user:pass@localhost/dbname
-pg://user:pass@localhost/dbname?sslmode=disable
-mysql://user:pass@localhost/dbname
-mysql:/var/run/mysqld/mysqld.sock
-sqlserver://user:pass@remote-host.com/dbname
-mssql://user:pass@remote-host.com/instance/dbname
-ms://user:pass@remote-host.com:port/instance/dbname?keepAlive=10
-oracle://user:pass@somehost.com/sid
-sap://user:pass@localhost/dbname
-file:myfile.sqlite3?loc=auto
-/path/to/sqlite/file/test.db
-odbc+postgres://user:pass@localhost:port/dbname?option1=
-clickhouse://user:pass@localhost:9000/dbname
-ch://user:pass@remote-host.com:9440/dbname?secure=true
-clickhouse+http://user:pass@localhost:8123/dbname
-clickhouse+https://user:pass@remote-host.com:8443/dbname
-```
-
-### ClickHouse notes
-
-- `clickhouse://` (alias `ch://`) uses the native protocol (port 9000 by default); `clickhouse+http://` and `clickhouse+https://` use the HTTP interface. Query parameters are passed to [clickhouse-go](https://github.com/ClickHouse/clickhouse-go#dsn), e.g. `?secure=true` for TLS on the native port.
-- The Constraints tab shows the table engine and its partition, sorting and primary keys. The Indexes tab shows data skipping indexes. ClickHouse has no foreign keys.
-- Row edits and deletes are run as mutations (`ALTER TABLE ... UPDATE/DELETE`) and wait for the mutation to finish. They only work on tables that support mutations (such as the MergeTree family), key columns cannot be updated, and ClickHouse primary keys are not unique: every row that shares the primary key values of the edited row is changed. Pending changes are not run in a transaction.
-
-<!-- ROADMAP -->
-
-## Roadmap
-
-- [ ] Support for NoSQL databases
-- [ ] Columns and indexes creation through TUI
-- [x] Table tree input filter
-- [x] Custom keybindings
-- [x] Show keybindings on a modal
-- [x] Rewrite row `create`, `update` and `delete` logic
-
-See the [open issues](https://github.com/jorgerojas26/lazysql/issues) for a full list of proposed features (and known issues).
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-## Clipboard support
-
-We use [atotto/clipboard](https://github.com/atotto/clipboard?tab=readme-ov-file#clipboard-for-go) to copy to clipboard.
-
-Platforms:
-
-- OSX
-- Windows 7 (probably work on other Windows)
-- Linux, Unix (requires 'xclip' or 'xsel' command to be installed)
-
-<!-- CONTRIBUTING -->
-
-## Contributing
-
-Contributions, issues, and pull requests are welcome!
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-<!-- LICENSE -->
+MySQL, PostgreSQL, SQLite, MSSQL, ClickHouse, and **Oracle** (this fork). MongoDB
+is not supported.
 
 ## License
 
-Distributed under the MIT License. See `LICENSE.txt` for more information.
+Distributed under the **MIT License**. See [`LICENSE.txt`](LICENSE.txt).
+
+Original project: [jorgerojas26/lazysql](https://github.com/jorgerojas26/lazysql)
+— Copyright (c) 2023 Jorge Rojas. This fork keeps the upstream license and
+attribution; the enhancements above are additions on top of v0.5.9.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-<!-- CONTACT -->
-
-## Contact
-
-Jorge Rojas - [LinkedIn](https://www.linkedin.com/in/jorgerojas26/) - jorgeluisrojasb@gmail.com
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-## Alternatives
-
-- [Mitzasql](https://github.com/vladbalmos/mitzasql)
-- [Gobang](https://github.com/TaKO8Ki/gobang)
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-<!-- MARKDOWN LINKS & IMAGES -->
-<!-- https://www.markdownguide.org/basic-syntax/#reference-style-links -->
-
-[contributors-shield]: https://img.shields.io/github/contributors/jorgerojas26/lazysql?style=for-the-badge
-[contributors-url]: https://github.com/jorgerojas26/lazysql/graphs/contributors
-[forks-shield]: https://img.shields.io/github/forks/jorgerojas26/lazysql?style=for-the-badge
-[forks-url]: https://github.com/jorgerojas26/lazysql/network/members
-[stars-shield]: https://img.shields.io/github/stars/jorgerojas26/lazysql?style=for-the-badge
-[stars-url]: https://github.com/jorgerojas26/lazysql/stargazers
-[issues-shield]: https://img.shields.io/github/issues/jorgerojas26/lazysql?style=for-the-badge
-[issues-url]: https://github.com/jorgerojas26/lazysql/issues
-[license-shield]: https://img.shields.io/github/license/jorgerojas26/lazysql.svg?style=for-the-badge
-[license-url]: https://github.com/jorgerojas26/lazysql/blob/main/LICENSE.txt
-[linkedin-shield]: https://img.shields.io/badge/-LinkedIn-black.svg?style=for-the-badge&logo=linkedin&colorB=555
-[linkedin-url]: https://linkedin.com/in/jorgerojas26
-[product-screenshot1]: images/lazysql-connection-selection.png
-[product-screenshot2]: images/lazysql.png
-[golang-shield]: https://img.shields.io/badge/Golang-gray?style=for-the-badge&logo=go
-[tview-shield]: https://img.shields.io/badge/tview-gray?style=for-the-badge&logo=go
-
-## Star History
-
-<a href="https://star-history.dera.page/#jorgerojas26/lazysql&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=jorgerojas26/lazysql&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=jorgerojas26/lazysql&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=jorgerojas26/lazysql&type=date&legend=top-left" />
- </picture>
-</a>
