@@ -721,12 +721,14 @@ func (db *MSSQL) ExecuteQuery(ctx context.Context, database, query string) ([][]
 	return results, len(records), nil
 }
 
-func (db *MSSQL) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
+// BuildPendingChangeQueries builds the statements ExecutePendingChanges would
+// run, so a pinned transaction session can apply them inside its own
+// transaction.
+func (db *MSSQL) BuildPendingChangeQueries(ctx context.Context, changes []models.DBDMLChange) ([]models.Query, error) {
 	ctx = contextOrBackground(ctx)
 	var queries []models.Query
 
 	for _, change := range changes {
-
 		formattedTableName := db.formatTableName(change.Table)
 
 		switch change.Type {
@@ -740,6 +742,15 @@ func (db *MSSQL) ExecutePendingChanges(ctx context.Context, changes []models.DBD
 		}
 	}
 
+	return queries, nil
+}
+
+func (db *MSSQL) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
+	ctx = contextOrBackground(ctx)
+	queries, err := db.BuildPendingChangeQueries(ctx, changes)
+	if err != nil {
+		return err
+	}
 	logger.Info("queries", map[string]any{"queries": queries})
 
 	return queriesInTransaction(ctx, db.Connection, queries)

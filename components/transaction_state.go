@@ -195,6 +195,9 @@ type PendingSummary struct {
 	Tables     []string
 	Failed     int
 	Since      time.Time
+	// CellEdits counts queued grid edits that are not part of the transaction
+	// yet (they are applied on demand with Ctrl+S).
+	CellEdits int
 }
 
 // SummarizePending aggregates the outstanding statements.
@@ -409,6 +412,10 @@ func txConfirmationText(action string, entries []txStatement, summary PendingSum
 		builder.WriteString("All of these changes will be discarded. This cannot be undone.")
 	} else {
 		builder.WriteString("These changes will be written to the database.")
+	}
+	if summary.CellEdits > 0 {
+		fmt.Fprintf(&builder, "\n\n[%s]Note:[-] %d queued cell edit(s) are not part of this transaction yet (Ctrl+S applies them here).",
+			app.Styles.SecondaryTextColor, summary.CellEdits)
 	}
 	if summary.Failed > 0 {
 		fmt.Fprintf(&builder, "\n\n[%s]Warning:[-] %d statement(s) failed while the transaction was open.",

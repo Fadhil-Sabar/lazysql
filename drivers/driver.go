@@ -48,6 +48,13 @@ func (err *PartialExecutionError) Unwrap() error {
 	return err.Err
 }
 
+// PendingChangeBuilder builds the statements that ExecutePendingChanges would
+// run without running them. It lets a pinned transaction session apply queued
+// grid changes inside its own transaction instead of a second one.
+type PendingChangeBuilder interface {
+	BuildPendingChangeQueries(ctx context.Context, changes []models.DBDMLChange) ([]models.Query, error)
+}
+
 type Driver interface {
 	Connect(ctx context.Context, urlstr string) error
 	TestConnection(ctx context.Context, urlstr string) error

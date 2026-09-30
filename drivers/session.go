@@ -19,7 +19,7 @@ var ErrSessionsUnsupported = errors.New("driver does not support pinned sessions
 type Session interface {
 	// Exec runs a statement that does not return rows and reports how many rows
 	// it affected. It returns -1 when the driver cannot report a count.
-	Exec(ctx context.Context, query string) (int64, error)
+	Exec(ctx context.Context, query string, args ...any) (int64, error)
 	// StreamQuery runs a row-returning statement on the pinned connection so
 	// in-transaction readers observe uncommitted writes.
 	StreamQuery(ctx context.Context, query string, maxRows int, onBatch func(QueryBatch) error) (QueryStreamResult, error)
@@ -41,8 +41,8 @@ type pinnedSession struct {
 	cleanup    func()
 }
 
-func (session *pinnedSession) Exec(ctx context.Context, query string) (int64, error) {
-	result, err := session.connection.ExecContext(contextOrBackground(ctx), query)
+func (session *pinnedSession) Exec(ctx context.Context, query string, args ...any) (int64, error) {
+	result, err := session.connection.ExecContext(contextOrBackground(ctx), query, args...)
 	if err != nil {
 		return 0, err
 	}

@@ -110,12 +110,13 @@ func TestNextTxPanelWidth(t *testing.T) {
 func TestTransactionPanelKeysTriggerHandlers(t *testing.T) {
 	panel := NewTransactionPanel(NewTransactionState())
 
-	commits, rollbacks, clears, unfocuses := 0, 0, 0, 0
+	commits, rollbacks, clears, unfocuses, toggles := 0, 0, 0, 0, 0
 	panel.SetHandlers(
 		func() { commits++ },
 		func() { rollbacks++ },
 		func() { clears++ },
 		func() { unfocuses++ },
+		func() { toggles++ },
 	)
 
 	press := func(event *tcell.EventKey) {
@@ -128,11 +129,12 @@ func TestTransactionPanelKeysTriggerHandlers(t *testing.T) {
 	press(tcell.NewEventKey(tcell.KeyRune, 'c', 0))
 	press(tcell.NewEventKey(tcell.KeyRune, 'r', 0))
 	press(tcell.NewEventKey(tcell.KeyRune, 'x', 0))
+	press(tcell.NewEventKey(tcell.KeyRune, 'm', 0))
 	press(tcell.NewEventKey(tcell.KeyEscape, 0, 0))
 
-	if commits != 1 || rollbacks != 1 || clears != 1 || unfocuses != 1 {
-		t.Fatalf("handler counts = commit:%d rollback:%d clear:%d unfocus:%d, want 1 each",
-			commits, rollbacks, clears, unfocuses)
+	if commits != 1 || rollbacks != 1 || clears != 1 || unfocuses != 1 || toggles != 1 {
+		t.Fatalf("handler counts = commit:%d rollback:%d clear:%d unfocus:%d toggle:%d, want 1 each",
+			commits, rollbacks, clears, unfocuses, toggles)
 	}
 
 	// Unbound keys must pass through so the panel never swallows editor input.
@@ -266,4 +268,76 @@ func TestClearHistoryRefusedWhileTransactionIsOpen(t *testing.T) {
 			t.Fatalf("front page = %q, want the transaction info dialog", name)
 		}
 	})
+}
+
+func TestEditorRouteManualCommitWrapsMutations(t *testing.T) {
+	table := &ResultsTable{txState: NewTransactionState()}
+
+	// Auto commit: only BEGIN/START TRANSACTION open a session.
+	if got := table.editorRoute("DELETE FROM public.crud_lab", "DELETE"); got != editorRoutePool {
+		t.Errorf("auto commit DELETE route = %v, want the pool", got)
+	}
+
+	table.Home = &Home{manualCommit: true}
+
+	if got := table.editorRoute("DELETE FROM public.crud_lab", "DELETE"); got != editorRouteSession {
+		t.Errorf("manual commit DELETE route = %v, want the pinned session", got)
+	}
+	if got := table.editorRoute("UPDATE public.crud_lab SET qty = 1", "UPDATE"); got != editorRouteSession {
+		t.Errorf("manual commit UPDATE route = %v, want the pinned session", got)
+	}
+	if got := table.editorRoute("INSERT INTO public.crud_lab (code) VALUES ('x')", "INSERT"); got != editorRouteSession {
+		t.Errorf("manual commit INSERT route = %v, want the pinned session", got)
+	}
+	// Reads must not open a transaction on their own.
+	if got := table.editorRoute("SELECT * FROM public.crud_lab", "SELECT"); got != editorRoutePool {
+		t.Errorf("manual commit SELECT route = %v, want the pool", got)
+	}
+	// DDL keeps its immediate behaviour: the schema refresh expects it applied.
+	if got := table.editorRoute("DROP TABLE public.nope", "DROP"); got != editorRoutePool {
+		t.Errorf("manual commit DROP route = %v, want the pool", got)
+	}
+}
+
+func TestToggleCommitModeFlipsModeAndReportsIt(t *testing.T) {
+	table := newTransactionTestTable()
+	home := &Home{}
+	table.Home = home
+
+	if table.manualCommitEnabled() {
+		t.Fatal("manual commit should start disabled")
+	}
+
+	table.ToggleCommitMode()
+
+	if !home.manualCommit {
+		t.Fatal("ToggleCommitMode did not enable manual commit")
+	}
+	status := table.Pagination.GetResultStatus()
+	if !strings.Contains(status, "MANUAL") {
+		t.Errorf("status after enabling manual commit = %q, want it to mention MANUAL", status)
+	}
+	if title := table.TxPanel.Wrapper.GetTitle(); !strings.Contains(title, "manual") {
+		t.Errorf("panel title = %q, want it to mention manual", title)
+	}
+
+	table.ToggleCommitMode()
+
+	if home.manualCommit {
+		t.Fatal("ToggleCommitMode did not restore auto commit")
+	}
+	if status := table.Pagination.GetResultStatus(); !strings.Contains(status, "AUTO") {
+		t.Errorf("status after disabling manual commit = %q, want it to mention AUTO", status)
+	}
+}
+
+func TestToggleCommitModeWithoutConnectionIsNoop(t *testing.T) {
+	table := newTransactionTestTable()
+	table.Home = nil
+
+	table.ToggleCommitMode() // must not panic
+
+	if table.manualCommitEnabled() {
+		t.Fatal("standalone tables have no manual commit mode")
+	}
 }

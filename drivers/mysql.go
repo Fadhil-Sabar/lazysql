@@ -666,12 +666,14 @@ func (db *MySQL) OpenSession(ctx context.Context, database string) (Session, err
 	}, nil)
 }
 
-func (db *MySQL) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
+// BuildPendingChangeQueries builds the statements ExecutePendingChanges would
+// run, so a pinned transaction session can apply them inside its own
+// transaction.
+func (db *MySQL) BuildPendingChangeQueries(ctx context.Context, changes []models.DBDMLChange) ([]models.Query, error) {
 	ctx = contextOrBackground(ctx)
 	var queries []models.Query
 
 	for _, change := range changes {
-
 		formattedTableName := db.formatTableName(change.Database, change.Table)
 
 		switch change.Type {
@@ -685,6 +687,15 @@ func (db *MySQL) ExecutePendingChanges(ctx context.Context, changes []models.DBD
 		}
 	}
 
+	return queries, nil
+}
+
+func (db *MySQL) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
+	ctx = contextOrBackground(ctx)
+	queries, err := db.BuildPendingChangeQueries(ctx, changes)
+	if err != nil {
+		return err
+	}
 	return queriesInTransaction(ctx, db.Connection, queries)
 }
 

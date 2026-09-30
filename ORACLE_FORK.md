@@ -278,6 +278,18 @@ a throwaway pool) and the transaction was meaningless.
 - `CancelExactCount`-style cleanup: closing a tab (or quitting) calls
   `CloseTransaction`, which rolls back and releases the pinned connection.
 
+**Manual commit mode.** `Home.manualCommit` is toggled from the transaction panel
+(`m`) or with `Ctrl+B`; `ResultsTable.editorRoute` then sends the first mutation of
+a tab through `execAutoBegin`, which issues `BEGIN` on the pinned session and
+records it in the history as `BEGIN (manual commit)`. Reads and DDL keep their
+immediate behaviour.
+
+Queued grid changes are applied on the pinned session too:
+`drivers.PendingChangeBuilder.BuildPendingChangeQueries` was extracted from each
+driver's `ExecutePendingChanges`, so the session runs the same parameterised
+statements while the driver keeps owning the SQL they are built from. The query
+preview modal gained `SetExecutor` for that.
+
 Two tview traps found while building this, both fixed:
 
 - `Home.focusTab` restores editor focus from a goroutine. It could run *after*

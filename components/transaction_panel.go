@@ -23,10 +23,14 @@ type TransactionPanel struct {
 
 	state *TransactionState
 
-	onCommit   func()
-	onRollback func()
-	onClear    func()
-	onUnfocus  func()
+	onCommit       func()
+	onRollback     func()
+	onClear        func()
+	onUnfocus      func()
+	onToggleCommit func()
+
+	// manualCommit reports whether writes wait for an explicit commit.
+	manualCommit func() bool
 
 	focused bool
 }
@@ -81,11 +85,22 @@ func (panel *TransactionPanel) State() *TransactionState {
 }
 
 // SetHandlers wires the panel actions to the owning ResultsTable.
-func (panel *TransactionPanel) SetHandlers(onCommit, onRollback, onClear, onUnfocus func()) {
+func (panel *TransactionPanel) SetHandlers(onCommit, onRollback, onClear, onUnfocus, onToggleCommit func()) {
 	panel.onCommit = onCommit
 	panel.onRollback = onRollback
 	panel.onClear = onClear
 	panel.onUnfocus = onUnfocus
+	panel.onToggleCommit = onToggleCommit
+}
+
+// SetManualCommitFunc lets the panel show the connection's commit mode.
+func (panel *TransactionPanel) SetManualCommitFunc(manualCommit func() bool) {
+	panel.manualCommit = manualCommit
+}
+
+// manualCommitEnabled reports the mode, defaulting to auto commit.
+func (panel *TransactionPanel) manualCommitEnabled() bool {
+	return panel.manualCommit != nil && panel.manualCommit()
 }
 
 // Focus moves keyboard focus into the history list.
@@ -158,36 +173,43 @@ func (panel *TransactionPanel) Render() {
 }
 
 func (panel *TransactionPanel) updateTitle(entries []txStatement) {
-	title := "[4] Transaction"
+	mode := ""
+	if panel.manualCommitEnabled() {
+		mode = " · manual"
+	}
+
+	title := "[4] Transaction" + mode
 
 	switch {
 	case panel.state.Active():
 		summary := panel.state.SummarizePending()
-		title = fmt.Sprintf("[4] Transaction · ACTIVE · %d pending · %d rows", summary.Statements, summary.Rows)
+		title = fmt.Sprintf("[4] Transaction · ACTIVE · %d pending · %d rows%s", summary.Statements, summary.Rows, mode)
 		if panel.state.Failed() {
-			title = fmt.Sprintf("[4] Transaction · FAILED · %d pending · rollback required", summary.Statements)
+			title = fmt.Sprintf("[4] Transaction · FAILED · %d pending · rollback required%s", summary.Statements, mode)
 		}
 	case len(entries) > 0:
-		title = fmt.Sprintf("[4] Transaction · %d statement(s)", len(entries))
+		title = fmt.Sprintf("[4] Transaction · %d statement(s)%s", len(entries), mode)
 	}
 
 	panel.Wrapper.SetTitle(" " + title + " ")
 }
 
 func (panel *TransactionPanel) updateFooter() {
+	dim := app.Styles.SecondaryTextColor
+
 	if panel.state.Active() {
-		panel.footer.SetText(fmt.Sprintf("[%s] c[-] commit   [%s]r[-] rollback   [%s]x[-] clear   [%s]y[-] copy",
-			app.Styles.SecondaryTextColor,
-			app.Styles.SecondaryTextColor,
-			app.Styles.SecondaryTextColor,
-			app.Styles.SecondaryTextColor))
+		panel.footer.SetText(fmt.Sprintf("[%s] c[-] commit  [%s]r[-] rollback  [%s]m[-] mode  [%s]x[-] clear",
+			dim, dim, dim, dim))
 		return
 	}
 
-	panel.footer.SetText(fmt.Sprintf("[%s] no active transaction   [%s]x[-] clear   [%s]y[-] copy",
-		app.Styles.SecondaryTextColor,
-		app.Styles.SecondaryTextColor,
-		app.Styles.SecondaryTextColor))
+	mode := "manual: off"
+	if panel.manualCommitEnabled() {
+		mode = "manual: ON"
+	}
+
+	panel.footer.SetText(fmt.Sprintf("[%s] m[-] %s  [%s]x[-] clear  [%s]y[-] copy",
+		dim, mode, dim, dim))
 }
 
 func (panel *TransactionPanel) inputCapture(event *tcell.EventKey) *tcell.EventKey {
@@ -202,6 +224,9 @@ func (panel *TransactionPanel) inputCapture(event *tcell.EventKey) *tcell.EventK
 		return nil
 	case commands.ClearTransactionHistory:
 		panel.trigger(panel.onClear)
+		return nil
+	case commands.ToggleCommitMode:
+		panel.trigger(panel.onToggleCommit)
 		return nil
 	case commands.Copy:
 		panel.copySelected()

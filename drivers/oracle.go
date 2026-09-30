@@ -516,17 +516,20 @@ func (db *Oracle) ExecuteQuery(ctx context.Context, database, query string) ([][
 	return results, len(records), nil
 }
 
-func (db *Oracle) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
+// BuildPendingChangeQueries builds the statements ExecutePendingChanges would
+// run, so a pinned transaction session can apply them inside its own
+// transaction.
+func (db *Oracle) BuildPendingChangeQueries(ctx context.Context, changes []models.DBDMLChange) ([]models.Query, error) {
 	ctx = contextOrBackground(ctx)
 	if len(changes) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	var queries []models.Query
 	for _, change := range changes {
 		formattedTableName, err := db.formatTableName(change.Table)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		switch change.Type {
@@ -537,6 +540,20 @@ func (db *Oracle) ExecutePendingChanges(ctx context.Context, changes []models.DB
 		case models.DMLDeleteType:
 			queries = append(queries, buildDeleteQuery(formattedTableName, change.PrimaryKeyInfo, db))
 		}
+	}
+
+	return queries, nil
+}
+
+func (db *Oracle) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
+	ctx = contextOrBackground(ctx)
+	if len(changes) == 0 {
+		return nil
+	}
+
+	queries, err := db.BuildPendingChangeQueries(ctx, changes)
+	if err != nil {
+		return err
 	}
 
 	return queriesInTransaction(ctx, db.Connection, queries)

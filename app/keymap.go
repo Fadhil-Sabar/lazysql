@@ -81,6 +81,7 @@ var Keymaps = KeymapSystem{
 			Bind{Key: Key{Char: '?'}, Cmd: cmd.HelpPopup, Description: "Help"},
 			Bind{Key: Key{Code: tcell.KeyCtrlP}, Cmd: cmd.SearchGlobal, Description: "Global search"},
 			Bind{Key: Key{Code: tcell.KeyCtrlUnderscore}, Cmd: cmd.ToggleQueryHistory, Description: "Toggle query history modal"},
+			Bind{Key: Key{Code: tcell.KeyCtrlB}, Cmd: cmd.ToggleCommitMode, Description: "Toggle manual/auto commit"},
 			Bind{Key: Key{Char: 'T'}, Cmd: cmd.TogglePanel, Description: "Collapse/expand focused panel"},
 			Bind{Key: Key{Char: '+'}, Cmd: cmd.GrowPanel, Description: "Grow focused panel"},
 			Bind{Key: Key{Char: '='}, Cmd: cmd.GrowPanel, Description: "Grow focused panel"},
@@ -209,6 +210,7 @@ var Keymaps = KeymapSystem{
 		TransactionGroup: {
 			Bind{Key: Key{Char: 'c'}, Cmd: cmd.CommitTransaction, Description: "Commit transaction"},
 			Bind{Key: Key{Char: 'r'}, Cmd: cmd.RollbackTransaction, Description: "Rollback transaction"},
+			Bind{Key: Key{Char: 'm'}, Cmd: cmd.ToggleCommitMode, Description: "Toggle manual/auto commit"},
 			Bind{Key: Key{Char: 'x'}, Cmd: cmd.ClearTransactionHistory, Description: "Clear finished history"},
 			Bind{Key: Key{Char: 'y'}, Cmd: cmd.Copy, Description: "Copy statement to clipboard"},
 			Bind{Key: Key{Char: 'j'}, Cmd: cmd.MoveDown, Description: "Next statement"},

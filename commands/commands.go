@@ -85,6 +85,7 @@ const (
 	CommitTransaction
 	RollbackTransaction
 	ClearTransactionHistory
+	ToggleCommitMode
 	UnfocusTreeFilter
 	CommitTreeFilter
 	NextFoundNode
@@ -242,6 +243,8 @@ func (c Command) String() string {
 		return "RollbackTransaction"
 	case ClearTransactionHistory:
 		return "ClearTransactionHistory"
+	case ToggleCommitMode:
+		return "ToggleCommitMode"
 	case NewConnection:
 		return "NewConnection"
 	case Connect:

@@ -491,6 +491,7 @@ func TestTransactionDefaultBindings(t *testing.T) {
 		{tcell.NewEventKey(tcell.KeyRune, 'c', 0), cmd.CommitTransaction},
 		{tcell.NewEventKey(tcell.KeyRune, 'r', 0), cmd.RollbackTransaction},
 		{tcell.NewEventKey(tcell.KeyRune, 'x', 0), cmd.ClearTransactionHistory},
+		{tcell.NewEventKey(tcell.KeyRune, 'm', 0), cmd.ToggleCommitMode},
 		{tcell.NewEventKey(tcell.KeyRune, 'y', 0), cmd.Copy},
 		{tcell.NewEventKey(tcell.KeyRune, 'j', 0), cmd.MoveDown},
 		{tcell.NewEventKey(tcell.KeyRune, 'k', 0), cmd.MoveUp},
@@ -500,6 +501,19 @@ func TestTransactionDefaultBindings(t *testing.T) {
 	for _, tc := range panel {
 		if got := transaction.Resolve(tc.event); got != tc.want {
 			t.Errorf("transaction group resolved %q to %s, want %s", tc.event.Name(), got, tc.want)
+		}
+	}
+}
+
+func TestCommitModeDefaultBindings(t *testing.T) {
+	if got := Keymaps.Group(HomeGroup).Resolve(tcell.NewEventKey(tcell.KeyCtrlB, 0, 0)); got != cmd.ToggleCommitMode {
+		t.Errorf("home group resolved Ctrl+B to %s, want ToggleCommitMode", got)
+	}
+
+	table := Keymaps.Group(TableGroup)
+	for _, r := range []rune{'c', 'r', 'i'} {
+		if got := table.Resolve(tcell.NewEventKey(tcell.KeyRune, r, 0)); got == cmd.ToggleCommitMode {
+			t.Errorf("results grid must not toggle commit mode on %q", r)
 		}
 	}
 }

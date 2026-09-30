@@ -597,12 +597,14 @@ func (db *SQLite) OpenSession(ctx context.Context, _ string) (Session, error) {
 	return openPinnedSession(ctx, db.Connection, "", nil)
 }
 
-func (db *SQLite) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
+// BuildPendingChangeQueries builds the statements ExecutePendingChanges would
+// run, so a pinned transaction session can apply them inside its own
+// transaction.
+func (db *SQLite) BuildPendingChangeQueries(ctx context.Context, changes []models.DBDMLChange) ([]models.Query, error) {
 	ctx = contextOrBackground(ctx)
 	var queries []models.Query
 
 	for _, change := range changes {
-
 		formattedTableName := db.formatTableName(change.Table)
 
 		switch change.Type {
@@ -616,6 +618,15 @@ func (db *SQLite) ExecutePendingChanges(ctx context.Context, changes []models.DB
 		}
 	}
 
+	return queries, nil
+}
+
+func (db *SQLite) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
+	ctx = contextOrBackground(ctx)
+	queries, err := db.BuildPendingChangeQueries(ctx, changes)
+	if err != nil {
+		return err
+	}
 	return queriesInTransaction(ctx, db.Connection, queries)
 }
 

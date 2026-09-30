@@ -94,13 +94,36 @@ The same `c` / `r` work on the results grid. Both ask for confirmation first: th
 dialog lists the pending statements, the tables affected, the total rows and when
 the transaction started. `Esc` / `No` cancels it.
 
+#### Manual commit mode
+
+Typing `BEGIN` every time is easy to forget, so the commit mode itself is
+switchable:
+
+| Key | Where |
+| --- | --- |
+| `Ctrl+B` | anywhere on the connection |
+| `m` | transaction panel |
+
+- **AUTO** (default): statements are written immediately, exactly as before.
+- **MANUAL**: the first `INSERT` / `UPDATE` / `DELETE` in a tab opens a
+  transaction for you (the panel shows a `BEGIN (manual commit)` row), and
+  nothing is written until you press `c`. Other sessions do not see the change,
+  your own `SELECT`s do, and `r` throws it away.
+
+The panel title carries the mode (`[4] Transaction · ACTIVE · 2 pending · 1 rows · manual`)
+and the footer shows `m manual: ON/OFF`. The mode is per connection and lasts for
+the session. Reads (`SELECT`) never open a transaction, and DDL keeps its
+immediate behaviour. Drivers without transactions (ClickHouse) report that
+manual mode is unavailable instead of silently accepting it.
+
 Worth knowing:
 
 - Closing the tab rolls an open transaction back, so a forgotten transaction
   cannot keep holding locks.
-- `Ctrl+S` (execute grid pending changes) is refused while a transaction is open;
-  finish it with `c` / `r` first. This keeps the two write paths from fighting
-  over the same rows.
+- `Ctrl+S` (execute grid pending changes) applies queued cell changes **inside**
+  the open transaction, so they commit together with `c` (in manual mode it opens
+  the transaction first). Tabs without an editor have no session and no panel, so
+  they keep the immediate behaviour.
 - A `SELECT` inside a transaction is read-your-writes but is not streamed, so it
   uses the configured query row cap.
 - Drivers without interactive transactions (ClickHouse) report that `BEGIN` is
@@ -200,10 +223,10 @@ full configuration reference, themes, and the manual DB test environment.
 | Context | Keys |
 | --- | --- |
 | Connection picker | `/` filter · `s` sort · `c`/`Enter` connect · `n` new · `e` edit · `d` delete · `q` quit |
-| Panels | `Ctrl+H/J/K/L` navigate · `1/2/3/4` focus · `+`/`-` resize · `T` collapse |
+| Panels | `Ctrl+H/J/K/L` navigate · `1/2/3/4` focus · `+`/`-` resize · `T` collapse · `Ctrl+B` manual/auto commit |
 | Editor | `/` `?` `Ctrl+F` search · `n`/`N` `*`/`#` matches · `Ctrl+R`/`Ctrl+E` run · `Ctrl+V` paste · `Ctrl+Space` external editor |
 | Results grid | `c` commit · `r` rollback · `i` change cell · `d` delete row · `Ctrl+S` run pending changes |
-| Transaction panel | `c` commit · `r` rollback · `x` clear · `y` copy · `j`/`k` history · `q` back |
+| Transaction panel | `c` commit · `r` rollback · `m` manual/auto commit · `x` clear · `y` copy · `j`/`k` history · `q` back |
 | Home | `Ctrl+E` editor · `Ctrl+S` run pending changes · `Ctrl+P` global search · `Ctrl+_` query history · `Backspace` connections · `?` help · `q` quit |
 
 Full tables (Home, Tree, Table, Sidebar, JSON viewer, …) are in the

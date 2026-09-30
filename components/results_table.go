@@ -353,7 +353,9 @@ func (table *ResultsTable) WithEditor() *ResultsTable {
 		table.RollbackTransaction,
 		table.ClearTransactionHistory,
 		table.focusEditorFromTransactionPanel,
+		table.ToggleCommitMode,
 	)
+	table.TxPanel.SetManualCommitFunc(table.manualCommitEnabled)
 	if table.txPanelWidth == 0 {
 		table.txPanelWidth = defaultTxPanelWidth
 	}

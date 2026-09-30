@@ -39,6 +39,10 @@ type Home struct {
 	metadataCache        *metadataCache
 	metadataCacheMu      sync.Mutex
 	schemaLoader         *schemaLoader
+	// manualCommit makes writes wait for an explicit commit (c) instead of
+	// committing them immediately. It applies to every editor tab of this
+	// connection and is toggled from the transaction panel (m) or with Ctrl+B.
+	manualCommit bool
 	// focusIntent counts explicit "focus this panel" requests. focusTab
 	// restores editor focus from a goroutine and must skip that restore when a
 	// newer intent (for example the transaction panel) has taken over.
@@ -1009,6 +1013,12 @@ func (home *Home) homeInputCapture(event *tcell.EventKey) *tcell.EventKey {
 			return nil
 		}
 		return event
+	case commands.ToggleCommitMode:
+		if table != nil {
+			table.ToggleCommitMode()
+			return nil
+		}
+		return event
 	case commands.GrowPanel:
 		if home.canUsePanelShortcuts() {
 			home.panelGrow()
@@ -1049,13 +1059,6 @@ func (home *Home) homeInputCapture(event *tcell.EventKey) *tcell.EventKey {
 			return nil
 		}
 	case commands.Save:
-		// Applying grid changes opens its own transaction on another
-		// connection. While an editor transaction is open that would fight
-		// over the same rows, so make the user finish it first.
-		if table != nil && table.hasActiveTransaction() {
-			table.showTransactionInfo("A transaction is open in this tab.\n\nCommit with c or roll back with r before executing pending cell changes.")
-			return nil
-		}
 		if home.ReadOnly {
 			errorModal := tview.NewModal().
 				SetText("Cannot save changes: Connection is in read-only mode").
@@ -1066,7 +1069,7 @@ func (home *Home) homeInputCapture(event *tcell.EventKey) *tcell.EventKey {
 			mainPages.AddPage(pageNameReadOnlyError, errorModal, true, true)
 			return event
 		}
-		if (len(home.ListOfDBChanges) > 0) && !table.GetIsEditing() {
+		if (len(home.ListOfDBChanges) > 0) && (table == nil || !table.GetIsEditing()) {
 			queryPreviewModal := NewQueryPreviewModal(&home.ListOfDBChanges, home.DBDriver, func() {
 				changes := append([]models.DBDMLChange(nil), home.ListOfDBChanges...)
 				for _, change := range changes {
@@ -1084,6 +1087,14 @@ func (home *Home) homeInputCapture(event *tcell.EventKey) *tcell.EventKey {
 				home.refreshKnownRecordTables(changes)
 				home.Tree.ForceRemoveHighlight()
 			})
+
+			// In an editor tab with manual commit (or a transaction already
+			// open), queued changes must join that transaction instead of
+			// committing on their own. Tabs without an editor have no session
+			// and no panel to commit them, so they keep the old behaviour.
+			if table != nil && table.Editor != nil && (table.hasActiveTransaction() || table.manualCommitEnabled()) {
+				queryPreviewModal.SetExecutor(table.ApplyPendingChangesOnSession)
+			}
 
 			mainPages.AddPage(pageNameDMLPreview, queryPreviewModal, true, true)
 		}

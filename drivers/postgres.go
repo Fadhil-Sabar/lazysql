@@ -815,16 +815,19 @@ func (db *Postgres) ExecuteQuery(ctx context.Context, database, query string) ([
 	return results, len(records), nil
 }
 
-func (db *Postgres) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
+// BuildPendingChangeQueries builds the statements ExecutePendingChanges would
+// run, so a pinned transaction session can apply them inside its own
+// transaction.
+func (db *Postgres) BuildPendingChangeQueries(ctx context.Context, changes []models.DBDMLChange) ([]models.Query, error) {
 	ctx = contextOrBackground(ctx)
+	var queries []models.Query
 	if len(changes) == 0 {
-		return nil
+		return queries, nil
 	}
 	database := changes[0].Database
 	if database == "" {
 		database = db.CurrentDatabase
 	}
-	var queries []models.Query
 
 	for _, change := range changes {
 		target := change.Database
@@ -832,12 +835,12 @@ func (db *Postgres) ExecutePendingChanges(ctx context.Context, changes []models.
 			target = db.CurrentDatabase
 		}
 		if target != database {
-			return errors.New("cannot atomically apply PostgreSQL changes across databases; apply each database separately")
+			return nil, errors.New("cannot atomically apply PostgreSQL changes across databases; apply each database separately")
 		}
 
 		formattedTableName, formatErr := db.formatTableName(change.Table)
 		if formatErr != nil {
-			return formatErr
+			return nil, formatErr
 		}
 
 		switch change.Type {
@@ -849,6 +852,25 @@ func (db *Postgres) ExecutePendingChanges(ctx context.Context, changes []models.
 		case models.DMLDeleteType:
 			queries = append(queries, buildDeleteQuery(formattedTableName, change.PrimaryKeyInfo, db))
 		}
+	}
+
+	return queries, nil
+}
+
+func (db *Postgres) ExecutePendingChanges(ctx context.Context, changes []models.DBDMLChange) error {
+	ctx = contextOrBackground(ctx)
+	if len(changes) == 0 {
+		return nil
+	}
+
+	database := changes[0].Database
+	if database == "" {
+		database = db.CurrentDatabase
+	}
+
+	queries, err := db.BuildPendingChangeQueries(ctx, changes)
+	if err != nil {
+		return err
 	}
 
 	conn, needsClose, err := db.connectionFor(ctx, database)

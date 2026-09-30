@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/rivo/tview"
 
 	"github.com/jorgerojas26/lazysql/app"
 	"github.com/jorgerojas26/lazysql/drivers"
+	"github.com/jorgerojas26/lazysql/models"
 )
 
 // This file wires explicit transactions into the editor tab. The rule is
@@ -32,7 +34,46 @@ func (table *ResultsTable) editorRoute(query, verb string) editorExecutionRoute 
 	if isTransactionBeginQuery(query, verb) {
 		return editorRouteSession
 	}
+	// Manual commit: the first mutation opens a transaction instead of being
+	// committed on the spot, so nothing lands until an explicit commit.
+	if table.manualCommitEnabled() && txMutatingVerb(verb) {
+		return editorRouteSession
+	}
 	return editorRoutePool
+}
+
+// manualCommitEnabled reports whether writes in this tab wait for an explicit
+// commit. The mode lives on the connection page so the panel toggle applies to
+// every editor tab of that connection.
+func (table *ResultsTable) manualCommitEnabled() bool {
+	return table.Home != nil && table.Home.manualCommit
+}
+
+// ToggleCommitMode switches between auto commit and manual commit and shows the
+// new mode in the results status line.
+func (table *ResultsTable) ToggleCommitMode() {
+	if table.Home == nil {
+		return
+	}
+
+	if !table.driverSupportsTransactions() {
+		table.showTransactionInfo(fmt.Sprintf(
+			"%s connections cannot hold a transaction open, so manual commit is not available.",
+			table.DBDriver.GetProvider()))
+		return
+	}
+
+	table.Home.manualCommit = !table.Home.manualCommit
+
+	status := "Commit mode: AUTO — statements are written immediately"
+	if table.Home.manualCommit {
+		status = "Commit mode: MANUAL — INSERT/UPDATE/DELETE stay pending until c (commit) or r (rollback)"
+	}
+
+	table.renderTransactionPanel()
+	table.SetResultsInfo(status)
+	table.SetQueryStatus(status)
+	App.ForceDraw()
 }
 
 // driverSupportsTransactions reports whether the connected driver can pin a
@@ -125,27 +166,29 @@ func (table *ResultsTable) runEditorTransactionStatement(ctx context.Context, ru
 	table.addEditorQueryToHistory(query)
 
 	inTx := table.txState.Active()
-	entryID := table.txState.Record(query, verb, inTx)
+	userBegins := isTransactionBeginQuery(query, verb)
+	// Manual commit opens the transaction before the first mutation so the write
+	// waits for an explicit commit instead of autocommitting.
+	autoBegins := !inTx && !userBegins && table.manualCommitEnabled() && txMutatingVerb(verb)
+
+	entryID := table.txState.Record(query, verb, inTx || autoBegins)
 
 	var (
-		err         error
-		affected    int64
-		kind        txKind
-		isQuery     = isResultProducingQuery(query)
-		result      string
-		streamed    drivers.QueryStreamResult
-		openedHere  bool
-		shouldBegin bool
+		err      error
+		affected int64
+		kind     txKind
+		isQuery  = isResultProducingQuery(query)
+		result   string
+		streamed drivers.QueryStreamResult
 	)
 
-	if isTransactionBeginQuery(query, verb) {
-		shouldBegin = true
-	}
-
-	if shouldBegin {
+	switch {
+	case autoBegins:
 		if err = table.openTransactionSession(ctx, run.database); err == nil {
-			openedHere = true
+			err = table.execAutoBegin(ctx)
 		}
+	case userBegins:
+		err = table.openTransactionSession(ctx, run.database)
 	}
 
 	if err == nil {
@@ -183,7 +226,7 @@ func (table *ResultsTable) runEditorTransactionStatement(ctx context.Context, ru
 	case err != nil:
 		// Keep the session open. On PostgreSQL the transaction is now aborted
 		// and only ROLLBACK can end it, which the panel surfaces.
-	case openedHere:
+	case userBegins:
 		table.txState.Begin()
 	case isTransactionEndQuery(query, verb):
 		if isTransactionRollbackQuery(query, verb) {
@@ -307,6 +350,86 @@ func txResultLabel(kind txKind, affected int64) string {
 	}
 }
 
+// execAutoBegin opens the transaction on the pinned session on the user's
+// behalf (manual commit mode). It is recorded in the history so the panel
+// explains why the following statement is pending.
+func (table *ResultsTable) execAutoBegin(ctx context.Context) error {
+	session := table.txSessionSnapshot()
+	if session == nil {
+		return errors.New("no transaction session is available")
+	}
+
+	entryID := table.txState.Record("BEGIN (manual commit)", "BEGIN", false)
+	affected, err := session.Exec(ctx, "BEGIN")
+	table.txState.Complete(entryID, txKindControl, affected, err)
+	if err != nil {
+		table.txState.Resolve(txOutcomeRolledBack)
+		table.closeTransactionSession()
+		return err
+	}
+
+	table.txState.Begin()
+	return nil
+}
+
+// ApplyPendingChangesOnSession runs queued grid changes on the pinned session, so
+// they join the open transaction instead of committing in a second one. It is
+// the executor the query preview modal uses while a transaction is open.
+func (table *ResultsTable) ApplyPendingChangesOnSession(ctx context.Context, changes []models.DBDMLChange) error {
+	builder, ok := table.DBDriver.(drivers.PendingChangeBuilder)
+	if !ok {
+		return fmt.Errorf("%s connections cannot apply cell changes inside a transaction", table.DBDriver.GetProvider())
+	}
+
+	// Manual commit: open the transaction on demand so queued cell changes wait
+	// like any other write in this mode.
+	if !table.hasActiveTransaction() {
+		if err := table.openTransactionSession(ctx, table.GetDatabaseName()); err != nil {
+			return err
+		}
+		if err := table.execAutoBegin(ctx); err != nil {
+			return err
+		}
+	}
+
+	session := table.txSessionSnapshot()
+	if session == nil {
+		return errors.New("no transaction session is available")
+	}
+
+	queries, err := builder.BuildPendingChangeQueries(ctx, changes)
+	if err != nil {
+		return err
+	}
+	if len(queries) != len(changes) {
+		return fmt.Errorf("built %d statements for %d changes", len(queries), len(changes))
+	}
+
+	for i, query := range queries {
+		label := query.Query
+		if rendered, renderErr := table.DBDriver.DMLChangeToQueryString(changes[i]); renderErr == nil && strings.TrimSpace(rendered) != "" {
+			label = rendered
+		}
+		verb := leadingQueryVerb(label)
+
+		entryID := table.txState.Record(label, verb, true)
+		affected, execErr := session.Exec(ctx, query.Query, query.Args...)
+
+		kind := txKindControl
+		if txMutatingVerb(verb) {
+			kind = txKindAffected
+		}
+		table.txState.Complete(entryID, kind, affected, execErr)
+		table.renderTransactionPanel()
+
+		if execErr != nil {
+			return execErr
+		}
+	}
+
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Commit / rollback
 // ---------------------------------------------------------------------------
@@ -350,6 +473,9 @@ func (table *ResultsTable) confirmTransactionEnd(action string) {
 
 	pending := table.txState.Pending()
 	summary := table.txState.SummarizePending()
+	if table.state != nil && table.state.listOfDBChanges != nil {
+		summary.CellEdits = len(*table.state.listOfDBChanges)
+	}
 
 	// Remember who asked for this so focus returns to the same panel.
 	table.txOwner = App.GetFocus()

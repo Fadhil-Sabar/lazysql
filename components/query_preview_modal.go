@@ -1,6 +1,7 @@
 package components
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -22,6 +23,16 @@ type QueryPreviewModal struct {
 	Table    *tview.Table
 	DBDriver drivers.Driver
 	Error    *tview.Modal
+
+	// executor overrides how the confirmed changes are applied. Pinned
+	// transaction sessions use it so the changes join the open transaction.
+	executor func(context.Context, []models.DBDMLChange) error
+}
+
+// SetExecutor overrides where the confirmed changes are executed. Without it the
+// driver applies them in its own transaction.
+func (modal *QueryPreviewModal) SetExecutor(executor func(context.Context, []models.DBDMLChange) error) {
+	modal.executor = executor
 }
 
 func NewQueryPreviewModal(queries *[]models.DBDMLChange, dbdriver drivers.Driver, onFinish func()) *QueryPreviewModal {
@@ -85,7 +96,11 @@ func NewQueryPreviewModal(queries *[]models.DBDMLChange, dbdriver drivers.Driver
 
 			confirmationModal.SetDoneFunc(func(_ int, buttonLabel string) {
 				if buttonLabel == "Yes" {
-					err := dbdriver.ExecutePendingChanges(app.App.Context(), *queries)
+					execute := dbdriver.ExecutePendingChanges
+					if r.executor != nil {
+						execute = r.executor
+					}
+					err := execute(app.App.Context(), *queries)
 					if err != nil {
 						if removeAppliedPendingChanges(queries, err) {
 							r.populateTable()
