@@ -241,3 +241,11 @@ rejected it with `pq: unterminated quoted string at or near "'"`. All of
 `effectiveSelectionRange`, which expands to whole lines in visual-line mode, and
 visual-line delete removes the lines entirely (vim `V` + `d`). Tests in
 `components/sql_editor_visual_test.go`.
+
+### DML affected-rows feedback
+
+Non-SELECT statements returned their status (`N rows affected`) via
+`SetResultsInfo`, which lives on the hidden "results info" page, while the visible
+pagination status was cleared — so running a DELETE/UPDATE looked like nothing
+happened. `runEditorDMLQuery` now also calls `SetQueryStatus(result)`, so the
+count shows in the status line under the results grid.

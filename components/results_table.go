@@ -1633,7 +1633,9 @@ func (table *ResultsTable) runEditorDMLQuery(ctx context.Context, run *editorQue
 		}
 
 		table.SetResultsInfo(result)
-		table.SetQueryStatus("")
+		// Show the outcome where the user is looking: the results grid is empty
+		// for DML, so surface it in the status line under the grid as well.
+		table.SetQueryStatus(result)
 		table.SetLoading(false)
 		// Clear filtering state before closing the quit confirmation: closing it
 		// can synchronously trigger Home.focusTab, which re-focuses the editor
